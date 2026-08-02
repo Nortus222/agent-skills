@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en" data-explain-doc>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}} — Explanation</title>
+
+<!-- ============================================================
+     COPY EVERYTHING FROM HERE TO </head> VERBATIM.
+     Do not restyle per-document; the point is that every
+     explanation looks like the same publication.
+     ============================================================ -->
+
+<link rel="stylesheet"
+      media="(prefers-color-scheme: light)"
+      href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github.min.css">
+<link rel="stylesheet"
+      media="(prefers-color-scheme: dark)"
+      href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+
+<style>
+:root {
+  --bg:        #fbfaf8;
+  --surface:   #ffffff;
+  --sunken:    #f3f1ed;
+  --ink:       #1f2328;
+  --ink-soft:  #57606a;
+  --ink-faint: #8b949e;
+  --rule:      #e2dfd9;
+  --accent:    #7a4b2a;
+  --accent-bg: #f6ede4;
+  --shadow:    0 1px 2px rgba(31,35,40,.06), 0 6px 24px rgba(31,35,40,.05);
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --sans:  ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+  --mono:  ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  --measure: 34rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:        #14161a;
+    --surface:   #1b1e24;
+    --sunken:    #22262d;
+    --ink:       #e6e3de;
+    --ink-soft:  #a8b0bb;
+    --ink-faint: #737b86;
+    --rule:      #2c3138;
+    --accent:    #e0a173;
+    --accent-bg: #2a221c;
+    --shadow:    0 1px 2px rgba(0,0,0,.4), 0 6px 24px rgba(0,0,0,.3);
+  }
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 2rem; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- layout ------------------------------------------------- */
+.wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3rem;
+  max-width: 78rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 8rem;
+}
+@media (min-width: 60rem) {
+  .wrap { grid-template-columns: 14rem minmax(0, 1fr); padding-inline: 3rem; }
+  .toc  { grid-column: 1; }
+  main  { grid-column: 2; }
+}
+main > * { max-width: var(--measure); }
+main > figure, main > .wide, main > .steps { max-width: 52rem; }
+
+/* ---- table of contents -------------------------------------- */
+.toc { font-family: var(--sans); font-size: .8rem; }
+@media (min-width: 60rem) {
+  .toc { position: sticky; top: 3rem; align-self: start; max-height: 90vh; overflow-y: auto; }
+}
+.toc h2 {
+  font-size: .68rem; text-transform: uppercase; letter-spacing: .1em;
+  color: var(--ink-faint); margin: 0 0 .75rem; font-weight: 600;
+}
+.toc ol { list-style: none; margin: 0; padding: 0; }
+.toc li { margin-bottom: .1rem; }
+.toc a {
+  display: block; padding: .3rem .6rem; margin-left: -.6rem;
+  border-radius: 6px; color: var(--ink-soft); text-decoration: none;
+}
+.toc a:hover { background: var(--sunken); color: var(--ink); }
+.toc a.active { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+
+/* ---- masthead ----------------------------------------------- */
+.masthead { border-bottom: 1px solid var(--rule); padding-bottom: 2rem; margin-bottom: 2.5rem; max-width: 52rem; }
+.eyebrow {
+  font-family: var(--sans); font-size: .7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .12em; color: var(--ink-faint);
+  margin: 0 0 .6rem;
+}
+h1 { font-size: 2.6rem; line-height: 1.12; margin: 0 0 1rem; letter-spacing: -.02em; font-weight: 600; }
+.lede { font-size: 1.2rem; line-height: 1.6; color: var(--ink-soft); margin: 0; max-width: var(--measure); }
+
+.tags { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1.5rem; font-family: var(--sans); }
+.tag {
+  display: inline-flex; align-items: baseline; gap: .4rem;
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 999px; padding: .3rem .8rem; font-size: .78rem;
+}
+.tag b { color: var(--ink-faint); font-weight: 600; text-transform: uppercase; font-size: .66rem; letter-spacing: .08em; }
+
+/* ---- sections ----------------------------------------------- */
+section { margin-bottom: 4rem; scroll-margin-top: 2rem; }
+h2 {
+  font-family: var(--sans); font-size: 1.45rem; font-weight: 650;
+  letter-spacing: -.01em; margin: 0 0 1.2rem; padding-top: .5rem;
+}
+h3 { font-family: var(--sans); font-size: 1.02rem; font-weight: 650; margin: 2rem 0 .6rem; }
+p { margin: 0 0 1.1rem; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: .18em; }
+
+/* ---- collapsible deep background ---------------------------- */
+details.deep {
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 0; margin: 0 0 1.8rem;
+  max-width: 52rem; box-shadow: var(--shadow); overflow: hidden;
+}
+details.deep > summary {
+  cursor: pointer; list-style: none; padding: 1rem 1.25rem;
+  font-family: var(--sans); font-size: .88rem; font-weight: 600;
+  display: flex; align-items: center; gap: .6rem; user-select: none;
+}
+details.deep > summary::-webkit-details-marker { display: none; }
+details.deep > summary::before {
+  content: "▶"; font-size: .65rem; color: var(--ink-faint);
+  transition: transform .15s ease;
+}
+details.deep[open] > summary::before { transform: rotate(90deg); }
+details.deep > summary .hint {
+  margin-left: auto; font-weight: 400; color: var(--ink-faint); font-size: .78rem;
+}
+details.deep > summary:hover { background: var(--sunken); }
+details.deep .body { padding: 0 1.25rem 1.25rem; border-top: 1px solid var(--rule); padding-top: 1.25rem; }
+details.deep .body > *:last-child { margin-bottom: 0; }
+
+/* ---- figures / mermaid -------------------------------------- */
+figure {
+  margin: 2rem 0; padding: 1.5rem;
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 10px; box-shadow: var(--shadow);
+}
+figure .mermaid { display: flex; justify-content: center; }
+figure .mermaid svg { max-width: 100%; height: auto; }
+figcaption {
+  font-family: var(--sans); font-size: .82rem; color: var(--ink-soft);
+  margin-top: 1.1rem; padding-top: .9rem; border-top: 1px solid var(--rule);
+  text-align: center;
+}
+figcaption b { color: var(--ink); font-weight: 600; }
+
+/* ---- walkthrough steps -------------------------------------- */
+.steps { list-style: none; counter-reset: step; margin: 0; padding: 0; }
+.steps > li {
+  counter-increment: step; position: relative;
+  padding: 0 0 2.25rem 3.25rem; border-left: 2px solid var(--rule);
+  margin-left: 1rem;
+}
+.steps > li:last-child { border-left-color: transparent; padding-bottom: 0; }
+.steps > li::before {
+  content: counter(step);
+  position: absolute; left: -1rem; top: -.15rem;
+  width: 2rem; height: 2rem; border-radius: 50%;
+  background: var(--accent-bg); color: var(--accent);
+  border: 1px solid var(--rule);
+  display: grid; place-items: center;
+  font-family: var(--sans); font-size: .82rem; font-weight: 700;
+}
+.steps h3 { margin-top: 0; }
+.steps .file {
+  display: inline-block; font-family: var(--mono); font-size: .76rem;
+  background: var(--sunken); color: var(--ink-soft);
+  border: 1px solid var(--rule); border-radius: 5px;
+  padding: .12rem .45rem; margin-bottom: .8rem; word-break: break-all;
+}
+.steps .why {
+  border-left: 3px solid var(--accent); background: var(--accent-bg);
+  padding: .7rem 1rem; border-radius: 0 6px 6px 0; margin: 1rem 0 0;
+  font-size: .95rem;
+}
+.steps .why b {
+  font-family: var(--sans); font-size: .66rem; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--accent); display: block; margin-bottom: .2rem;
+}
+
+/* ---- code --------------------------------------------------- */
+pre {
+  background: var(--sunken); border: 1px solid var(--rule); border-radius: 8px;
+  padding: 1rem 1.15rem; overflow-x: auto; margin: 1.2rem 0;
+  font-size: .82rem; line-height: 1.55;
+}
+pre code { font-family: var(--mono); background: none; padding: 0; }
+.hljs { background: none !important; color: inherit; }
+:not(pre) > code {
+  font-family: var(--mono); font-size: .86em;
+  background: var(--sunken); border: 1px solid var(--rule);
+  border-radius: 4px; padding: .08em .35em;
+}
+
+/* ---- sources ------------------------------------------------ */
+.sources { list-style: none; padding: 0; margin: 1.2rem 0 0; font-family: var(--sans); font-size: .88rem; }
+.sources li { padding: .5rem 0; border-top: 1px solid var(--rule); }
+.sources .kind {
+  display: inline-block; min-width: 5.5rem; color: var(--ink-faint);
+  font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 600;
+}
+.none { color: var(--ink-faint); font-style: italic; }
+
+/* ---- footer ------------------------------------------------- */
+footer {
+  max-width: 52rem; margin-top: 5rem; padding-top: 1.5rem;
+  border-top: 1px solid var(--rule);
+  font-family: var(--sans); font-size: .76rem; color: var(--ink-faint);
+}
+footer code { font-size: .95em; }
+
+@media print {
+  .toc { display: none; }
+  details.deep { break-inside: avoid; }
+  details.deep > summary::before { display: none; }
+  figure, .steps > li { break-inside: avoid; }
+  body { font-size: 11pt; background: #fff; }
+}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+
+<!-- Regenerate this list to match the sections actually present. -->
+<nav class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#at-a-glance">At a glance</a></li>
+    <li><a href="#background">Background</a></li>
+    <li><a href="#why">Why</a></li>
+    <li><a href="#intuition">Intuition</a></li>
+    <li><a href="#walkthrough">Walkthrough</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <header class="masthead">
+    <p class="eyebrow">Explanation</p>
+    <h1>{{TITLE}}</h1>
+    <p class="lede">{{ONE_SENTENCE_HOOK}}</p>
+    <div class="tags">
+      <span class="tag"><b>Kind</b> {{KIND}}</span>
+      <span class="tag"><b>Area</b> {{SUBSYSTEM}}</span>
+      <span class="tag"><b>Scope</b> {{WHAT_WAS_READ}}</span>
+    </div>
+  </header>
+
+  <section id="at-a-glance">
+    <h2>At a glance</h2>
+    <p>{{One paragraph, plain language, naming what this achieves. No file paths.}}</p>
+  </section>
+
+  <section id="background">
+    <h2>Background</h2>
+
+    <!-- NARROW first: the reader already in this area starts here. -->
+    <p>{{Short, specific background for someone who already knows this area.}}</p>
+
+    <!-- DEEP: collapsed, explicitly skippable, written for a genuine newcomer. -->
+    <details class="deep">
+      <summary>
+        Start from zero — the surrounding system
+        <span class="hint">skip if you know this area</span>
+      </summary>
+      <div class="body">
+        <p>{{Explain the surrounding system to someone who has never worked here.
+            Several paragraphs is fine. This is the one place length is welcome.}}</p>
+      </div>
+    </details>
+  </section>
+
+  <section id="why">
+    <h2>Why</h2>
+    <p>{{The intent, drawn only from evidence actually found. If no plan, spec,
+        issue, or commit message stated a rationale, say exactly that here —
+        do not reconstruct a motive from the code.}}</p>
+
+    <!-- Only the sources actually used. If none, replace <ul> with the .none line. -->
+    <ul class="sources">
+      <li><span class="kind">{{issue}}</span> <a href="{{URL}}">{{TITLE}}</a></li>
+    </ul>
+    <!-- <p class="none">No plan, spec, or issue stated a rationale.</p> -->
+  </section>
+
+  <section id="intuition">
+    <h2>Intuition</h2>
+    <p>{{The essence, carried by concrete toy data. Plain nouns over API names.
+        No file paths, no line numbers — those belong in the walkthrough.}}</p>
+
+    <!-- Up to 4 figures. Reuse a couple of diagram families; a data-flow diagram
+         carrying example values beats a class diagram. -->
+    <figure>
+      <div class="mermaid">
+flowchart LR
+    A["input: {{concrete example value}}"] --> B[step] --> C["output: {{concrete result}}"]
+      </div>
+      <figcaption><b>{{Short title.}}</b> {{What to notice in it.}}</figcaption>
+    </figure>
+  </section>
+
+  <section id="walkthrough">
+    <h2>Walkthrough</h2>
+    <p>{{One sentence on the order chosen and why it is the order to read in.}}</p>
+
+    <ol class="steps">
+      <li>
+        <h3>{{Step title}}</h3>
+        <span class="file">{{path/to/File.cs}}</span>
+        <p>{{What it does.}}</p>
+        <pre><code class="language-csharp">{{only the essential lines — never a whole file}}</code></pre>
+        <div class="why"><b>Why this way</b>{{What this buys, or what it makes possible next.}}</div>
+      </li>
+    </ol>
+  </section>
+
+  <footer>
+    Generated by the <code>explain</code> skill on {{DATE}} · target <code>{{TARGET}}</code>{{ · at commit <code>SHA</code>}}<br>
+    Comprehension only — this document makes no claim about correctness.
+  </footer>
+
+</main>
+</div>
+
+<!-- ============================================================
+     COPY THIS SCRIPT BLOCK VERBATIM.
+     ============================================================ -->
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
+<script>
+  if (window.hljs) hljs.highlightAll();
+
+  // Scrollspy for the sidebar.
+  const links = [...document.querySelectorAll('.toc a')];
+  const byId = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+  const spy = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      const a = byId.get(e.target.id);
+      if (a && e.isIntersecting) { links.forEach(l => l.classList.remove('active')); a.classList.add('active'); }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+  document.querySelectorAll('main section[id]').forEach(s => spy.observe(s));
+
+  // Expand collapsed background before printing, so it survives to PDF.
+  addEventListener('beforeprint', () => document.querySelectorAll('details.deep').forEach(d => d.open = true));
+</script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const css = getComputedStyle(document.documentElement);
+  mermaid.initialize({
+    startOnLoad: true,
+    securityLevel: 'strict',
+    theme: 'base',
+    fontFamily: css.getPropertyValue('--sans').trim(),
+    themeVariables: {
+      background:        css.getPropertyValue('--surface').trim(),
+      primaryColor:      css.getPropertyValue('--accent-bg').trim(),
+      primaryTextColor:  css.getPropertyValue('--ink').trim(),
+      primaryBorderColor:css.getPropertyValue('--accent').trim(),
+      lineColor:         css.getPropertyValue('--ink-soft').trim(),
+      secondaryColor:    css.getPropertyValue('--sunken').trim(),
+      tertiaryColor:     css.getPropertyValue('--bg').trim(),
+      textColor:         css.getPropertyValue('--ink').trim(),
+      darkMode:          dark
+    }
+  });
+</script>
+</body>
+</html>
