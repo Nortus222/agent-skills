@@ -1,6 +1,6 @@
 ---
 name: explain
-description: Use when the user wants something explained so they genuinely understand it — a file, a class, a module or subsystem, a concept, a commit range, a branch diff, uncommitted work, or a PR. Triggers: "explain X", "how does X work", "walk me through X", "what does this change do", "help me understand X", "onboard me to X".
+description: 'Use when the user wants something explained so they genuinely understand it — a file, a class, a module or subsystem, a concept, a commit range, a branch diff, uncommitted work, or a PR. Triggers: "explain X", "how does X work", "walk me through X", "what does this change do", "help me understand X", "onboard me to X".'
 argument-hint: "What should I explain? (path, subsystem, concept, commit range, branch, or PR)"
 ---
 
