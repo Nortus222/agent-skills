@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy Mobile Apps"
+  short_description: "Coordinate guarded mobile app releases"
+  default_prompt: "Use $deploy-mobile-apps to prepare and release the managed mobile apps."
