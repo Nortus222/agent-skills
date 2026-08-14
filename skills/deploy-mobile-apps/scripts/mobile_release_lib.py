@@ -428,7 +428,16 @@ class ReleaseOperator:
         repository_path = Path(app_record["repository_path"])
         dev_sha = self._remote_branch_sha(app, app.dev_branch, repository_path)
         release_sha = self._remote_branch_sha(app, app.release_branch, repository_path)
-        if dev_sha == release_sha:
+        ancestry_command = ["git", "merge-base", "--is-ancestor", dev_sha, release_sha]
+        ancestry = self.runner.run(ancestry_command, cwd=repository_path, mutates=False)
+        if ancestry.returncode not in {0, 1}:
+            command = self._redact(shlex.join(ancestry_command))
+            stderr = self._redact(ancestry.stderr.strip()) or "no stderr"
+            raise ReleaseError(
+                f"repository {app.repository}: command `{command}` failed with exit code "
+                f"{ancestry.returncode}: {stderr}"
+            )
+        if ancestry.returncode == 0:
             app_record["status"] = "skipped"
             app_record["state"] = "prepare-complete"
             app_record["release_sha"] = release_sha
@@ -499,6 +508,23 @@ class ReleaseOperator:
             )
         if not isinstance(checks, list):
             raise ReleaseError(f"repository {app.repository}: invalid preparation check response")
+        if checks and all(
+            isinstance(check, dict)
+            and check.get("bucket") in {"pass", "pending", "skipping"}
+            for check in checks
+        ) and any(check.get("bucket") == "pending" for check in checks):
+            checks_command.extend(["--watch", "--fail-fast"])
+            checks_result = self.runner.run(checks_command, mutates=False)
+            checks = self._load_json(
+                checks_result.stdout,
+                repository=app.repository,
+                subject="preparation check response",
+            )
+            no_checks_reported = False
+            if not isinstance(checks, list):
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid preparation check response"
+                )
         if any(
             not isinstance(check, dict)
             or check.get("bucket") not in {"pass", "skipping"}

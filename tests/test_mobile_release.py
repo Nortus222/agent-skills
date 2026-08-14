@@ -57,7 +57,9 @@ class PreparationRunner:
         existing_pr=False,
         duplicate_pr=False,
         failed_checks=False,
+        pending_check_outcome=None,
         no_checks=False,
+        release_contains_dev=False,
         merge_conflict=False,
         dirty_worktree=False,
         push_rejected=False,
@@ -69,7 +71,10 @@ class PreparationRunner:
         self.existing_pr = existing_pr
         self.duplicate_pr = duplicate_pr
         self.failed_checks = failed_checks
+        self.pending_check_outcome = pending_check_outcome
+        self.check_calls = 0
         self.no_checks = no_checks
+        self.release_contains_dev = release_contains_dev
         self.merge_conflict = merge_conflict
         self.dirty_worktree = dirty_worktree
         self.push_rejected = push_rejected
@@ -85,6 +90,9 @@ class PreparationRunner:
             return CommandResult(0, f"{self.remote_dev}\trefs/heads/dev\n", "")
         if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/release"):
             return CommandResult(0, f"{self.remote_release}\trefs/heads/release\n", "")
+        if command[:3] == ("git", "merge-base", "--is-ancestor"):
+            is_ancestor = self.release_contains_dev or command[3] == command[4]
+            return CommandResult(0 if is_ancestor else 1, "", "")
         if command == ("git", "check-ignore", "-q", ".claude/worktrees"):
             return CommandResult(0, "", "")
         if command[:3] == ("git", "worktree", "add"):
@@ -139,8 +147,34 @@ class PreparationRunner:
                 "",
             )
         if command[:3] == ("gh", "pr", "checks"):
+            self.check_calls += 1
             if self.no_checks:
                 return CommandResult(1, "", "no checks reported")
+            if self.pending_check_outcome and self.check_calls == 1:
+                return CommandResult(
+                    8,
+                    json.dumps(
+                        [{"name": "tests", "state": "PENDING", "bucket": "pending"}]
+                    ),
+                    "",
+                )
+            if self.pending_check_outcome:
+                if "--watch" not in command or "--fail-fast" not in command:
+                    raise AssertionError(f"pending checks were not watched: {command}")
+                failed = self.pending_check_outcome == "fail"
+                return CommandResult(
+                    1 if failed else 0,
+                    json.dumps(
+                        [
+                            {
+                                "name": "tests",
+                                "state": "FAILURE" if failed else "SUCCESS",
+                                "bucket": "fail" if failed else "pass",
+                            }
+                        ]
+                    ),
+                    "",
+                )
             bucket = "fail" if self.failed_checks else "pass"
             state = "FAILURE" if self.failed_checks else "SUCCESS"
             return CommandResult(
@@ -188,7 +222,9 @@ def prepared_operator(
     existing_pr=False,
     duplicate_pr=False,
     failed_checks=False,
+    pending_check_outcome=None,
     no_checks=False,
+    release_contains_dev=False,
     merge_conflict=False,
     dirty_worktree=False,
     push_rejected=False,
@@ -210,7 +246,9 @@ def prepared_operator(
         existing_pr=existing_pr,
         duplicate_pr=duplicate_pr,
         failed_checks=failed_checks,
+        pending_check_outcome=pending_check_outcome,
         no_checks=no_checks,
+        release_contains_dev=release_contains_dev,
         merge_conflict=merge_conflict,
         dirty_worktree=dirty_worktree,
         push_rejected=push_rejected,
@@ -531,6 +569,23 @@ class PrepareTests(unittest.TestCase):
             "no dev to release changes",
         )
 
+    def test_prepare_skips_when_release_contains_a_different_dev_tip(self):
+        operator, batch = prepared_operator(
+            submodule_changed=False,
+            release_contains_dev=True,
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"])
+
+        app = result["apps"]["pocket-manage"]
+        self.assertNotEqual(operator.runner.remote_dev, operator.runner.remote_release)
+        self.assertEqual(app["status"], "skipped")
+        self.assertEqual(app["skip_reason"], "no dev to release changes")
+        self.assertFalse(
+            any(call.args[:3] == ("gh", "pr", "list") for call in operator.runner.calls)
+        )
+
     def test_prepare_records_rejected_dev_push(self):
         operator, batch = prepared_operator(push_rejected=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -573,6 +628,33 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseError, "preparation checks failed"):
             operator.prepare(batch["batch_id"])
 
+        self.assertFalse(
+            any(call.args[:3] == ("gh", "pr", "merge") for call in operator.runner.calls)
+        )
+
+    def test_prepare_waits_for_pending_checks_to_pass(self):
+        operator, batch = prepared_operator(
+            existing_pr=True,
+            pending_check_outcome="pass",
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"])
+
+        self.assertEqual(result["apps"]["pocket-manage"]["status"], "prepared")
+        self.assertEqual(operator.runner.check_calls, 2)
+
+    def test_prepare_waits_for_pending_checks_to_fail(self):
+        operator, batch = prepared_operator(
+            existing_pr=True,
+            pending_check_outcome="fail",
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "preparation checks failed"):
+            operator.prepare(batch["batch_id"])
+
+        self.assertEqual(operator.runner.check_calls, 2)
         self.assertFalse(
             any(call.args[:3] == ("gh", "pr", "merge") for call in operator.runner.calls)
         )
