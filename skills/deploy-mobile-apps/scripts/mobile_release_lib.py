@@ -144,7 +144,7 @@ def new_batch(selected_apps: Sequence[str], now: str | None = None) -> dict[str,
 
 
 class ReleaseOperator:
-    """Inspect every selected repository before any release write is allowed."""
+    """Guard phase-oriented mobile release reads and writes."""
 
     def __init__(
         self,
@@ -181,6 +181,468 @@ class ReleaseOperator:
         if not dry_run:
             self.store.save(batch)
         return batch
+
+    def prepare(self, batch_id: str, dry_run: bool = False) -> dict[str, Any]:
+        """Update development pointers and merge each exact promotion PR."""
+        batch = self.store.load(batch_id)
+        if batch.get("state") not in {
+            "preflight-complete",
+            "prepare-in-progress",
+            "prepare-failed",
+            "prepare-complete",
+        }:
+            raise ReleaseError(f"batch {batch_id}: prepare is not allowed from its current state")
+
+        batch["state"] = "prepare-in-progress"
+        for app_key in batch["selected_apps"]:
+            app = self.inventory.apps[app_key]
+            app_record = batch["apps"][app_key]
+            self._initialize_preparation_record(app_record)
+            try:
+                if self._completed_preparation_is_current(app, app_record):
+                    continue
+                self._prepare_development_pointer(
+                    batch,
+                    app,
+                    app_record,
+                    dry_run=dry_run,
+                )
+                self._promote_development(
+                    batch,
+                    app,
+                    app_record,
+                    dry_run=dry_run,
+                )
+            except ReleaseError as error:
+                app_record["status"] = "failed"
+                app_record["state"] = "prepare-failed"
+                app_record["error"] = str(error)
+                batch["state"] = "prepare-failed"
+                if not dry_run:
+                    self.store.save(batch)
+                raise
+
+        batch["state"] = "dry-run-complete" if dry_run else "prepare-complete"
+        if not dry_run:
+            self.store.save(batch)
+        return batch
+
+    @staticmethod
+    def _initialize_preparation_record(app_record: dict[str, Any]) -> None:
+        app_record.setdefault("worktree", None)
+        app_record.setdefault("submodule_before", app_record["packages_pointer_sha"])
+        app_record.setdefault("submodule_after", app_record["packages_sha"])
+        app_record.setdefault("dev_push", "pending")
+        app_record.setdefault("preparation_pr", app_record.get("dev_to_release_pr"))
+        app_record.setdefault("release_sha", app_record["release_sha"])
+        app_record.setdefault("status", "pending")
+        app_record.setdefault("error", None)
+        app_record.setdefault("planned_commands", [])
+
+    def _completed_preparation_is_current(
+        self,
+        app: AppConfig,
+        app_record: dict[str, Any],
+    ) -> bool:
+        preparation_pr = app_record.get("preparation_pr") or {}
+        if preparation_pr.get("status") != "merged" or not preparation_pr.get("number"):
+            return False
+
+        preparation_was_complete = app_record.get("status") == "prepared"
+
+        pull_request = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    str(preparation_pr["number"]),
+                    "--repo",
+                    app.repository,
+                    "--json",
+                    "number,url,state,mergedAt,mergeable,mergeStateStatus,headRefName,baseRefName",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="preparation pull request response",
+        )
+        if not isinstance(pull_request, dict):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid preparation pull request response"
+            )
+        if (
+            pull_request.get("state") != "MERGED"
+            or pull_request.get("headRefName") != app.dev_branch
+            or pull_request.get("baseRefName") != app.release_branch
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: recorded preparation merge is no longer current"
+            )
+        release_sha = self._remote_branch_sha(
+            app,
+            app.release_branch,
+            Path(app_record["repository_path"]),
+        )
+        if preparation_was_complete and release_sha != app_record.get("release_sha"):
+            raise ReleaseError(
+                f"repository {app.repository}: release changed after preparation merge"
+            )
+        app_record["release_sha"] = release_sha
+        app_record["error"] = None
+        app_record["status"] = "prepared"
+        app_record["state"] = "prepare-complete"
+        return True
+
+    def _prepare_development_pointer(
+        self,
+        batch: dict[str, Any],
+        app: AppConfig,
+        app_record: dict[str, Any],
+        *,
+        dry_run: bool,
+    ) -> None:
+        repository_path = Path(app_record["repository_path"])
+        current_dev = self._remote_branch_sha(app, app.dev_branch, repository_path)
+        if app_record["dev_push"] == "pushed":
+            if current_dev != app_record["dev_sha"]:
+                raise ReleaseError(
+                    f"repository {app.repository}: origin/dev changed after recorded push"
+                )
+            return
+        if current_dev != app_record["dev_sha"]:
+            raise ReleaseError(f"repository {app.repository}: origin/dev changed after preflight")
+
+        if app_record["submodule_before"] == app_record["submodule_after"]:
+            app_record["dev_push"] = "unchanged"
+            return
+
+        worktree_path = (
+            repository_path
+            / ".claude"
+            / "worktrees"
+            / f"{batch['batch_id']}-{app.key}"
+        )
+        branch = f"deploy-mobile-apps/{batch['batch_id']}/{app.key}"
+        app_record["worktree"] = str(worktree_path)
+        mutation_commands = [
+            ["git", "worktree", "add", "-b", branch, str(worktree_path), app_record["dev_sha"]],
+            ["git", "submodule", "update", "--init", "--", app.submodule_path],
+            [
+                "git",
+                "-C",
+                app.submodule_path,
+                "checkout",
+                "--detach",
+                app_record["submodule_after"],
+            ],
+            ["git", "add", "--", app.submodule_path],
+            ["git", "commit", "-m", "chore: update shared packages"],
+            ["git", "push", "origin", f"HEAD:{app.dev_branch}"],
+        ]
+        self._run(
+            ["git", "check-ignore", "-q", ".claude/worktrees"],
+            cwd=repository_path,
+            repository=app.repository,
+        )
+        if dry_run:
+            app_record["planned_commands"].extend(mutation_commands)
+            app_record["dev_push"] = "planned"
+            return
+
+        self._run(
+            mutation_commands[0],
+            cwd=repository_path,
+            repository=app.repository,
+            mutates=True,
+        )
+        for command in mutation_commands[1:4]:
+            self._run(
+                command,
+                cwd=worktree_path,
+                repository=app.repository,
+                mutates=True,
+            )
+
+        staged_paths = self._run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=worktree_path,
+            repository=app.repository,
+        ).stdout.splitlines()
+        if staged_paths not in ([], [app.submodule_path]):
+            raise ReleaseError(
+                f"repository {app.repository}: preparation staged paths other than {app.submodule_path}"
+            )
+        if staged_paths:
+            self._run(
+                mutation_commands[4],
+                cwd=worktree_path,
+                repository=app.repository,
+                mutates=True,
+            )
+            prepared_dev_sha = self._run(
+                ["git", "rev-parse", "HEAD^{commit}"],
+                cwd=worktree_path,
+                repository=app.repository,
+            ).stdout.strip()
+            if not _is_sha(prepared_dev_sha):
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid prepared development commit"
+                )
+            current_dev = self._remote_branch_sha(app, app.dev_branch, repository_path)
+            if current_dev != app_record["dev_sha"]:
+                raise ReleaseError(f"repository {app.repository}: origin/dev changed before push")
+            push = self.runner.run(mutation_commands[5], cwd=worktree_path, mutates=True)
+            if push.returncode != 0:
+                stderr = self._redact(push.stderr.strip()) or "no stderr"
+                raise ReleaseError(f"repository {app.repository}: dev push rejected: {stderr}")
+            app_record["dev_sha"] = prepared_dev_sha
+            app_record["dev_push"] = "pushed"
+            app_record["state"] = "dev-prepared"
+            self.store.save(batch)
+        else:
+            app_record["dev_push"] = "unchanged"
+
+        worktree_status = self._run(
+            ["git", "status", "--porcelain"],
+            cwd=worktree_path,
+            repository=app.repository,
+        ).stdout
+        if not worktree_status.strip():
+            self._run(
+                ["git", "worktree", "remove", str(worktree_path)],
+                cwd=repository_path,
+                repository=app.repository,
+                mutates=True,
+            )
+            app_record["worktree"] = None
+
+    def _promote_development(
+        self,
+        batch: dict[str, Any],
+        app: AppConfig,
+        app_record: dict[str, Any],
+        *,
+        dry_run: bool,
+    ) -> None:
+        repository_path = Path(app_record["repository_path"])
+        dev_sha = self._remote_branch_sha(app, app.dev_branch, repository_path)
+        release_sha = self._remote_branch_sha(app, app.release_branch, repository_path)
+        if dev_sha == release_sha:
+            app_record["status"] = "skipped"
+            app_record["state"] = "prepare-complete"
+            app_record["release_sha"] = release_sha
+            app_record["skip_reason"] = "no dev to release changes"
+            return
+
+        pull_requests = self._list_preparation_pull_requests(app)
+        if len(pull_requests) > 1:
+            raise ReleaseError(
+                f"repository {app.repository}: duplicate preparation pull requests"
+            )
+
+        if dry_run and not pull_requests:
+            create = self._preparation_pr_create_command(app)
+            app_record["planned_commands"].append(create)
+            number = "<preparation-pr-number>"
+            app_record["planned_commands"].append(
+                ["gh", "pr", "merge", number, "--repo", app.repository, "--merge"]
+            )
+            app_record["status"] = "planned"
+            return
+
+        if pull_requests:
+            pull_request = self._validate_exact_preparation_pr(app, pull_requests[0])
+            pull_request["status"] = "open"
+        else:
+            created = self._run(
+                self._preparation_pr_create_command(app),
+                repository=app.repository,
+                mutates=True,
+            ).stdout.strip()
+            match = re.fullmatch(r"https://github\.com/[^/]+/[^/]+/pull/(\d+)", created)
+            if match is None:
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid preparation pull request URL"
+                )
+            pull_request = {
+                "number": int(match.group(1)),
+                "url": created,
+                "headRefName": app.dev_branch,
+                "baseRefName": app.release_branch,
+                "status": "open",
+            }
+            app_record["preparation_pr"] = pull_request
+            self.store.save(batch)
+
+        app_record["preparation_pr"] = pull_request
+        number = str(pull_request["number"])
+        checks_command = [
+            "gh",
+            "pr",
+            "checks",
+            number,
+            "--repo",
+            app.repository,
+            "--json",
+            "name,state,bucket",
+        ]
+        checks_result = self.runner.run(checks_command, mutates=False)
+        no_checks_reported = "no checks" in checks_result.stderr.lower()
+        if no_checks_reported and not checks_result.stdout.strip():
+            checks = []
+        else:
+            checks = self._load_json(
+                checks_result.stdout,
+                repository=app.repository,
+                subject="preparation check response",
+            )
+        if not isinstance(checks, list):
+            raise ReleaseError(f"repository {app.repository}: invalid preparation check response")
+        if any(
+            not isinstance(check, dict)
+            or check.get("bucket") not in {"pass", "skipping"}
+            for check in checks
+        ):
+            raise ReleaseError(f"repository {app.repository}: preparation checks failed")
+        if checks_result.returncode != 0 and not (not checks and no_checks_reported):
+            command = self._redact(shlex.join(checks_command))
+            stderr = self._redact(checks_result.stderr.strip()) or "no stderr"
+            raise ReleaseError(
+                f"repository {app.repository}: command `{command}` failed with exit code "
+                f"{checks_result.returncode}: {stderr}"
+            )
+        pull_request_state = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    number,
+                    "--repo",
+                    app.repository,
+                    "--json",
+                    "number,url,state,mergedAt,mergeable,mergeStateStatus,headRefName,baseRefName",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="preparation pull request response",
+        )
+        if not isinstance(pull_request_state, dict):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid preparation pull request response"
+            )
+        self._validate_exact_preparation_pr(app, pull_request_state)
+        if (
+            pull_request_state.get("state") != "OPEN"
+            or pull_request_state.get("mergeable") != "MERGEABLE"
+            or pull_request_state.get("mergeStateStatus") == "DIRTY"
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: preparation pull request is not mergeable"
+            )
+
+        if dry_run:
+            app_record["planned_commands"].append(
+                ["gh", "pr", "merge", number, "--repo", app.repository, "--merge"]
+            )
+            app_record["status"] = "planned"
+            return
+
+        self._run(
+            ["gh", "pr", "merge", number, "--repo", app.repository, "--merge"],
+            repository=app.repository,
+            mutates=True,
+        )
+        pull_request.update({"status": "merged", "checks": checks})
+        app_record["preparation_pr"] = pull_request
+        self.store.save(batch)
+
+        app_record["release_sha"] = self._remote_branch_sha(
+            app, app.release_branch, repository_path
+        )
+        app_record["status"] = "prepared"
+        app_record["state"] = "prepare-complete"
+        app_record["error"] = None
+
+    def _list_preparation_pull_requests(self, app: AppConfig) -> list[dict[str, Any]]:
+        response = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "pr",
+                    "list",
+                    "--repo",
+                    app.repository,
+                    "--state",
+                    "open",
+                    "--base",
+                    app.release_branch,
+                    "--head",
+                    app.dev_branch,
+                    "--json",
+                    "number,url,headRefName,baseRefName",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="preparation pull request response",
+        )
+        if not isinstance(response, list) or not all(isinstance(item, dict) for item in response):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid preparation pull request response"
+            )
+        return response
+
+    @staticmethod
+    def _preparation_pr_create_command(app: AppConfig) -> list[str]:
+        return [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            app.repository,
+            "--base",
+            app.release_branch,
+            "--head",
+            app.dev_branch,
+            "--title",
+            "chore: promote dev to release",
+            "--body",
+            "Promote the prepared development branch to release.",
+        ]
+
+    @staticmethod
+    def _validate_exact_preparation_pr(
+        app: AppConfig, pull_request: dict[str, Any]
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(pull_request.get("number"), int)
+            or not isinstance(pull_request.get("url"), str)
+            or pull_request.get("headRefName") != app.dev_branch
+            or pull_request.get("baseRefName") != app.release_branch
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: unexpected preparation pull request"
+            )
+        return dict(pull_request)
+
+    def _remote_branch_sha(
+        self, app: AppConfig, branch: str, repository_path: Path
+    ) -> str:
+        ref = f"refs/heads/{branch}"
+        output = self._run(
+            ["git", "ls-remote", "--exit-code", "origin", ref],
+            cwd=repository_path,
+            repository=app.repository,
+        ).stdout.splitlines()
+        if len(output) != 1:
+            raise ReleaseError(f"repository {app.repository}: ambiguous remote branch {branch}")
+        fields = output[0].split()
+        if len(fields) != 2 or not _is_sha(fields[0]) or fields[1] != ref:
+            raise ReleaseError(f"repository {app.repository}: invalid remote branch {branch}")
+        return fields[0]
 
     def _validate_selection(self, app_keys: list[str]) -> None:
         if not app_keys:
