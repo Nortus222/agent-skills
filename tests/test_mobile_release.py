@@ -379,6 +379,9 @@ class ReleaseRunner:
         codemagic_checks="queued",
         resumed_merge=False,
         merge_confirmation_fails=False,
+        extra_label=False,
+        head_race=False,
+        already_merged=False,
     ):
         self.calls = []
         self.current_head = current_head
@@ -392,7 +395,14 @@ class ReleaseRunner:
         self.missing_release = missing_release
         self.codemagic_checks = codemagic_checks
         self.merge_confirmation_fails = merge_confirmation_fails
-        self.merged = {"MarketplaceSoftware/pocketmanage"} if resumed_merge else set()
+        self.extra_label = extra_label
+        self.head_race = head_race
+        self.successful_merges = []
+        self.merged = (
+            {"MarketplaceSoftware/pocketmanage"}
+            if resumed_merge or already_merged
+            else set()
+        )
         self.merge_shas = {
             "MarketplaceSoftware/pocketmanage": "4" * 40,
             "MarketplaceSoftware/pocketmanage_installers": "5" * 40,
@@ -429,7 +439,10 @@ class ReleaseRunner:
                         "baseRefName": "main" if self.changed_base else "release",
                         "labels": []
                         if self.missing_label
-                        else [{"name": "autorelease: pending"}],
+                        else [
+                            {"name": "autorelease: pending"},
+                            *([{"name": "unexpected"}] if self.extra_label else []),
+                        ],
                         "statusCheckRollup": checks,
                         "mergeCommit": {
                             "oid": self.merge_shas[repository]
@@ -443,7 +456,10 @@ class ReleaseRunner:
         if command[:3] == ("gh", "pr", "merge"):
             if self.second_merge_fails and repository.endswith("_installers"):
                 return CommandResult(1, "", "merge failed")
+            if self.head_race and "--match-head-commit" in command:
+                return CommandResult(1, "", "head branch was modified")
             self.merged.add(repository)
+            self.successful_merges.append(repository)
             return CommandResult(0, "", "")
         if command[:2] == ("gh", "api") and "/contents/" in command[2]:
             version = {
@@ -586,6 +602,9 @@ def awaiting_approval_operator(
     codemagic_checks="queued",
     resumed_merge=False,
     merge_confirmation_fails=False,
+    extra_label=False,
+    head_race=False,
+    already_merged=False,
 ):
     app_keys = app_keys or ["pocket-manage"]
     skipped_apps = set(skipped_apps or [])
@@ -605,6 +624,9 @@ def awaiting_approval_operator(
         codemagic_checks=codemagic_checks,
         resumed_merge=resumed_merge,
         merge_confirmation_fails=merge_confirmation_fails,
+        extra_label=extra_label,
+        head_race=head_race,
+        already_merged=already_merged,
     )
     clock = FakeClock()
     operator = ReleaseOperator(
@@ -644,6 +666,8 @@ def awaiting_approval_operator(
                     "conclusion": "SUCCESS",
                 }
             ],
+            "release_pr_base": "release",
+            "release_pr_labels": ["autorelease: pending"],
             "release_pr_head_sha": "a" * 40,
             "submodule_sha": "f" * 40,
             "result": "ready for approval",
@@ -845,6 +869,8 @@ class InventoryTests(unittest.TestCase):
         self.assertFalse(_is_sha("g" * 40))
         self.assertFalse(_is_sha("a" * 39))
         self.assertFalse(_is_sha("a" * 41))
+        self.assertFalse(_is_sha(f" {'a' * 40}"))
+        self.assertFalse(_is_sha(f"{'a' * 40} "))
 
 
 class PreflightTests(unittest.TestCase):
@@ -1287,6 +1313,8 @@ class DiscoveryTests(unittest.TestCase):
         app = result["apps"]["pocket-manage"]
         self.assertEqual(app["version"], "2.7.0")
         self.assertEqual(app["release_pr_head_sha"], "a" * 40)
+        self.assertEqual(app["release_pr_base"], "release")
+        self.assertEqual(app["release_pr_labels"], ["autorelease: pending"])
         self.assertEqual(result["state"], "awaiting-approval")
 
     def test_no_release_pr_is_a_nonblocking_reported_skip(self):
@@ -1317,6 +1345,8 @@ class DiscoveryTests(unittest.TestCase):
                     "checks": [
                         {"name": "release-please", "conclusion": "SUCCESS"}
                     ],
+                    "base": "release",
+                    "labels": ["autorelease: pending"],
                     "head_sha": "a" * 40,
                     "submodule_sha": "f" * 40,
                     "result": "ready for approval",
@@ -1404,6 +1434,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(operator.store.load(batch["batch_id"])["state"], "awaiting-approval")
         self.assertFalse(any(call.mutates for call in operator.runner.calls))
 
+    def test_extra_release_label_invalidates_batch_approval(self):
+        operator, batch = awaiting_approval_operator(extra_label=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(
+            saved["apps"]["pocket-manage"]["release_pr_labels"],
+            ["autorelease: pending", "unexpected"],
+        )
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
     def test_changed_release_base_invalidates_batch_approval(self):
         operator, batch = awaiting_approval_operator(changed_base=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1482,6 +1526,32 @@ class ReleaseTests(unittest.TestCase):
         )
         self.assertNotEqual(merged_snapshot["state"], "partial-release")
 
+    def test_release_merge_is_bound_to_the_approved_head(self):
+        operator, batch = awaiting_approval_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.release(batch["batch_id"])
+
+        merge = next(
+            call
+            for call in operator.runner.calls
+            if call.args[:3] == ("gh", "pr", "merge")
+        )
+        self.assertIn("--match-head-commit", merge.args)
+        self.assertEqual(merge.args[-1], "a" * 40)
+
+    def test_head_race_rejection_records_no_successful_merge(self):
+        operator, batch = awaiting_approval_operator(head_race=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "release failed"):
+            operator.release(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["state"], "release-failed")
+        self.assertEqual(saved["apps"]["pocket-manage"]["release_merge"], "failed")
+        self.assertEqual(operator.runner.successful_merges, [])
+
     def test_failed_first_merge_sets_release_failed(self):
         operator, batch = awaiting_approval_operator(
             app_keys=["installers"], second_merge_fails=True
@@ -1528,6 +1598,18 @@ class ReleaseTests(unittest.TestCase):
         merges = [call for call in operator.runner.calls if call.args[:3] == ("gh", "pr", "merge")]
         self.assertEqual(len(merges), 1)
         self.assertEqual(result["state"], "released")
+
+    def test_release_reconciles_a_merge_completed_before_the_first_local_save(self):
+        operator, batch = awaiting_approval_operator(already_merged=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        app = result["apps"]["pocket-manage"]
+        self.assertEqual(app["release_merge"], "merged")
+        self.assertEqual(app["release_merge_sha"], "4" * 40)
+        self.assertEqual(result["state"], "released")
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
 
     def test_release_accepts_a_lightweight_tag_on_the_merge_commit(self):
         operator, batch = awaiting_approval_operator()
