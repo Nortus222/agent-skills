@@ -1,5 +1,6 @@
 import base64
 import copy
+import io
 import json
 import sys
 import tempfile
@@ -7,11 +8,13 @@ import unittest
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1] / "skills" / "deploy-mobile-apps"
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
+import mobile_release
 from mobile_release_lib import (
     BatchStore,
     CommandResult,
@@ -23,6 +26,175 @@ from mobile_release_lib import (
     new_batch,
     _is_sha,
 )
+
+
+class CliTests(unittest.TestCase):
+    @staticmethod
+    def _batch(state="awaiting-approval"):
+        return {
+            "batch_id": "batch-1",
+            "state": state,
+            "selected_apps": ["pocket-manage"],
+            "apps": {
+                "pocket-manage": {
+                    "version": "2.7.0",
+                    "release_pr_number": 42,
+                    "release_pr_url": "https://github.com/example/repo/pull/42",
+                    "release_pr_checks": [
+                        {"name": "release-please", "conclusion": "SUCCESS"}
+                    ],
+                    "release_pr_head_sha": "a" * 40,
+                    "submodule_sha": "b" * 40,
+                    "result": "ready for approval",
+                }
+            },
+        }
+
+    def test_release_requires_an_explicit_batch_id(self):
+        with self.assertRaises(SystemExit) as raised:
+            mobile_release.main(["release"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_prepare_dry_run_reaches_operator_without_mutation(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            factory.return_value.prepare.return_value = self._batch("dry-run-complete")
+            with mock.patch("sys.stdout", io.StringIO()):
+                mobile_release.main(
+                    ["prepare", "--batch", "batch-1", "--dry-run", "--json"]
+                )
+            factory.return_value.prepare.assert_called_once_with(
+                "batch-1", dry_run=True
+            )
+
+    def test_preflight_json_defaults_to_all_configured_apps(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.inventory.apps = {"pocket-manage": object(), "partner": object()}
+            operator.preflight.return_value = self._batch("preflight-complete")
+            stdout = io.StringIO()
+
+            with mock.patch("sys.stdout", stdout):
+                result = mobile_release.main(["preflight", "--dry-run", "--json"])
+
+        self.assertEqual(result, 0)
+        operator.preflight.assert_called_once_with(
+            ["pocket-manage", "partner"], dry_run=True
+        )
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["batch_id"], "batch-1")
+        self.assertEqual(
+            document["next_command"],
+            "mobile_release.py prepare --batch batch-1",
+        )
+
+    def test_partial_batch_warning_is_printed_before_preflight(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.inventory.apps = {"pocket-manage": object(), "partner": object()}
+            stderr = io.StringIO()
+
+            def preflight(apps, dry_run=False):
+                self.assertIn("partial batch", stderr.getvalue())
+                return self._batch("preflight-complete")
+
+            operator.preflight.side_effect = preflight
+            with mock.patch("sys.stderr", stderr), mock.patch("sys.stdout", io.StringIO()):
+                mobile_release.main(
+                    ["preflight", "--app", "partner", "--dry-run", "--json"]
+                )
+
+        operator.preflight.assert_called_once_with(["partner"], dry_run=True)
+
+    def test_human_summary_includes_checks_warnings_and_next_command(self):
+        batch = self._batch()
+        batch["apps"]["pocket-manage"]["worktree"] = "/tmp/preserved"
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            factory.return_value.status.return_value = batch
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                mobile_release.main(["status", "--batch", "batch-1"])
+
+        output = stdout.getvalue()
+        self.assertIn("Batch: batch-1", output)
+        self.assertIn("State: awaiting-approval", output)
+        self.assertIn("release-please=SUCCESS", output)
+        self.assertIn(f"submodule={'b' * 40}", output)
+        self.assertIn("preserved worktree /tmp/preserved", output)
+        self.assertIn("mobile_release.py release --batch batch-1", output)
+
+    def test_release_error_prints_the_saved_recovery_summary(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.release.side_effect = ReleaseError("approval snapshot changed")
+            operator.status.return_value = self._batch()
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = mobile_release.main(
+                    ["release", "--batch", "batch-1", "--json"]
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("approval snapshot changed", stderr.getvalue())
+        self.assertIn("Batch: batch-1", stderr.getvalue())
+        self.assertIn("Next command:", stderr.getvalue())
+
+    def test_keyboard_interrupt_returns_130_without_inventing_progress(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.prepare.side_effect = KeyboardInterrupt
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+                result = mobile_release.main(
+                    ["prepare", "--batch", "batch-1", "--json"]
+                )
+
+        self.assertEqual(result, 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        operator.status.assert_not_called()
+
+    def test_release_dry_run_only_reloads_saved_status(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.status.return_value = self._batch()
+            with mock.patch("sys.stdout", io.StringIO()):
+                result = mobile_release.main(
+                    ["release", "--batch", "batch-1", "--dry-run", "--json"]
+                )
+
+        self.assertEqual(result, 0)
+        operator.status.assert_called_once_with("batch-1")
+        operator.release.assert_not_called()
+
+    def test_status_rechecks_unverified_builds_without_remote_mutation(self):
+        operator, batch = awaiting_approval_operator(codemagic_checks="timeout")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        released = operator.release(batch["batch_id"])
+        self.assertEqual(released["state"], "released-builds-unverified")
+        previous_call_count = len(operator.runner.calls)
+        previous_snapshot_count = len(operator.store.snapshots)
+        operator.runner.codemagic_checks = "queued"
+        stdout = io.StringIO()
+
+        with mock.patch.object(mobile_release, "build_operator", return_value=operator):
+            with mock.patch("sys.stdout", stdout):
+                result = mobile_release.main(
+                    ["status", "--batch", batch["batch_id"], "--json"]
+                )
+
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(document["state"], "released")
+        self.assertTrue(operator.runner.calls[previous_call_count:])
+        self.assertFalse(
+            any(call.mutates for call in operator.runner.calls[previous_call_count:])
+        )
+        self.assertEqual(len(operator.store.snapshots), previous_snapshot_count)
+        self.assertEqual(
+            operator.store.load(batch["batch_id"])["state"],
+            "released-builds-unverified",
+        )
 
 
 @dataclass(frozen=True)

@@ -101,3 +101,62 @@ Success criterion: each repository returns a Codemagic check with `status: in_pr
 - It does not report apps skipped because the submodule pointer is current, `dev` and `release` have no diff, or Release Please finds no releasable changes.
 - It does not define partial-release recovery after one version PR merges and a later repository fails.
 - It does not require or report links for the three named CodeMagic check runs; it only filters generic Codemagic checks.
+
+## Completed-skill forward test
+
+Prompt:
+
+````text
+Use $deploy-mobile-apps at <absolute-skill-path> to respond to this request:
+"Push an update for all managed mobile apps. Stop before any live mutation and explain
+the commands, approval boundary, stale-approval behavior, skipped-app behavior, and
+CodeMagic verification you would apply."
+````
+
+Response (verbatim):
+
+````text
+I have not run any command or inspected live repository or remote state.
+
+The managed batch covers:
+
+- Pocket Manage
+- Pocket Manage Installers
+- Pocket Manage Partner
+
+For all apps, I would run from the skill directory without any `--app` filters:
+
+```bash
+python scripts/mobile_release.py preflight --json
+python scripts/mobile_release.py prepare --batch <batch-id> --json
+```
+
+`preflight` checks readiness. `prepare` begins live changes, so I am stopping before it. After `prepare` eventually reaches `awaiting-approval`, I would report each app’s proposed version, Release Please PR number and URL, checks, head SHA, submodule SHA, and result or skip reason. I would also report the batch ID, warnings, preserved worktrees, and safe next command.
+
+Approval is limited to that exact batch snapshot: the displayed PR numbers, versions, and head SHAs. I would ask for one explicit confirmation and would not run `release` in the same response. After confirmation, the only release command would be:
+
+```bash
+python scripts/mobile_release.py release --batch <batch-id> --json
+```
+
+If a Release Please head changes, the prior approval becomes stale. I would refuse to release that changed head, show the refreshed batch summary, and request new confirmation. A new batch also needs its own approval.
+
+A skipped app remains in the batch summary with its recorded reason and is never merged. If only part of the batch releases, I would name the merged and remaining apps, report the failure, then resume the same batch with `release` only.
+
+Release verification stops once all configured CodeMagic checks are detected:
+
+- `Build Android AppBundle and Publish`
+- `Build IPA and Publish To AppStore Connect`
+- `Build Web and Publish to Firebase Hosting`
+
+I would report every check’s name, state, and URL. A failed check counts as detected, and I would not wait for builds to finish. On timeout, I would report `released-builds-unverified`, include tag and commit URLs, identify seen and missing checks, and use this read-only command for later observation:
+
+```bash
+python scripts/mobile_release.py status --batch <batch-id> --json
+```
+````
+
+Comparison: **PASS**. The response stayed read-only, named the exact saved-batch
+confirmation boundary, refused a changed Release Please head, kept skipped apps in
+the report, covered partial-release recovery, and stopped CodeMagic verification
+after detecting every configured check run rather than waiting for completion.
