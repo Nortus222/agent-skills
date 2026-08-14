@@ -16,6 +16,9 @@ from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 
+PACKAGES_REPOSITORY = "MarketplaceSoftware/packages"
+
+
 class ReleaseError(RuntimeError):
     """Report a release guard failure without exposing process credentials."""
 
@@ -276,6 +279,26 @@ class ReleaseOperator:
             raise ReleaseError(
                 f"repository {app.repository}: submodule checkout {app.submodule_path} is unavailable"
             )
+        submodule_origins = [
+            value.strip()
+            for value in self._run(
+                ["git", "remote", "get-url", "--all", "origin"],
+                cwd=submodule_path,
+                repository=app.repository,
+            ).stdout.splitlines()
+            if value.strip()
+        ]
+        if len(submodule_origins) != 1:
+            raise ReleaseError(
+                f"repository {app.repository}: ambiguous packages origin configuration"
+            )
+        if _normalize_repository(submodule_origins[0]) != _normalize_repository(
+            PACKAGES_REPOSITORY
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: packages origin does not match "
+                f"{PACKAGES_REPOSITORY}"
+            )
         self._run(
             ["git", "fetch", "origin", _remote_tracking_refspec(app.submodule_branch)],
             cwd=submodule_path,
@@ -379,14 +402,14 @@ class ReleaseOperator:
         )
 
     def _redact(self, text: str) -> str:
-        redacted = text
-        for key, value in self.environ.items():
-            secret_name = any(
-                marker in key.upper() for marker in ("TOKEN", "SECRET", "PASSWORD")
-            )
-            if value and (len(value) >= 8 or secret_name):
-                redacted = redacted.replace(value, "<redacted>")
-        return redacted
+        values = sorted(
+            {value for value in self.environ.values() if value},
+            key=len,
+            reverse=True,
+        )
+        if not values:
+            return text
+        return re.sub("|".join(re.escape(value) for value in values), "<redacted>", text)
 
     @staticmethod
     def _load_json(value: str, *, repository: str, subject: str) -> Any:

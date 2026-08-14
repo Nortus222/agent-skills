@@ -53,6 +53,7 @@ def successful_preflight_responses(app_count=3):
                 CommandResult(0, "", ""),
                 CommandResult(0, f"{'d' * 40}\n{'r' * 40}\n", ""),
                 CommandResult(0, f"160000 commit {'c' * 40}\tpackages\n", ""),
+                CommandResult(0, "git@github.com:MarketplaceSoftware/packages.git\n", ""),
                 CommandResult(0, "", ""),
                 CommandResult(0, f"{'p' * 40}\n", ""),
                 CommandResult(0, "{}\n{}\n", ""),
@@ -150,6 +151,17 @@ class PreflightTests(unittest.TestCase):
             ("git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"),
             [call.args for call in operator.runner.calls],
         )
+        packages_path = (
+            Path(operator._test_temporary_directory.name) / "workspace/pocketmanage/packages"
+        ).resolve()
+        self.assertIn(
+            RecordedCall(
+                ("git", "remote", "get-url", "--all", "origin"),
+                packages_path,
+                False,
+            ),
+            operator.runner.calls,
+        )
         self.assertEqual(list(operator.runner.responses), [])
 
     def test_preflight_failure_saves_no_batch(self):
@@ -186,6 +198,28 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseError, "duplicate dev to release pull requests"):
             operator.preflight(["pocket-manage"])
 
+        self.assertEqual(list(operator.store.root.glob("*.json")), [])
+
+    def test_preflight_rejects_mismatched_packages_origin(self):
+        responses = successful_preflight_responses(app_count=1)
+        responses[7] = CommandResult(
+            0,
+            "git@github.com:MarketplaceSoftware/not-packages.git\n",
+            "",
+        )
+        operator = make_operator(responses)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "packages origin does not match"):
+            operator.preflight(["pocket-manage"])
+
+        self.assertFalse(
+            any(
+                call.args
+                == ("git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main")
+                for call in operator.runner.calls
+            )
+        )
         self.assertEqual(list(operator.store.root.glob("*.json")), [])
 
     def test_preflight_rejects_workflow_names_found_only_in_nested_fields(self):
@@ -232,3 +266,17 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("exit code 1", message)
         self.assertIn("authentication failed", message)
         self.assertNotIn(secret, message)
+
+    def test_command_failure_redacts_short_environment_values(self):
+        short_key = "abc"
+        operator = make_operator(
+            [CommandResult(1, "", f"authentication failed for {short_key}")],
+            environment={"API_KEY": short_key},
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaises(ReleaseError) as raised:
+            operator.preflight(["pocket-manage"])
+
+        self.assertIn("authentication failed", str(raised.exception))
+        self.assertNotIn(short_key, str(raised.exception))
