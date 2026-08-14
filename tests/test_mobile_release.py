@@ -60,6 +60,7 @@ class PreparationRunner:
         pending_check_outcome=None,
         no_checks=False,
         release_contains_dev=False,
+        release_object_requires_fetch=False,
         merge_conflict=False,
         dirty_worktree=False,
         push_rejected=False,
@@ -75,6 +76,8 @@ class PreparationRunner:
         self.check_calls = 0
         self.no_checks = no_checks
         self.release_contains_dev = release_contains_dev
+        self.release_object_requires_fetch = release_object_requires_fetch
+        self.promotion_refs_fetched = False
         self.merge_conflict = merge_conflict
         self.dirty_worktree = dirty_worktree
         self.push_rejected = push_rejected
@@ -90,8 +93,26 @@ class PreparationRunner:
             return CommandResult(0, f"{self.remote_dev}\trefs/heads/dev\n", "")
         if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/release"):
             return CommandResult(0, f"{self.remote_release}\trefs/heads/release\n", "")
+        if command == (
+            "git",
+            "fetch",
+            "origin",
+            "+refs/heads/dev:refs/remotes/origin/dev",
+            "+refs/heads/release:refs/remotes/origin/release",
+        ):
+            self.promotion_refs_fetched = True
+            return CommandResult(0, "", "")
+        if command == (
+            "git",
+            "rev-parse",
+            "refs/remotes/origin/dev^{commit}",
+            "refs/remotes/origin/release^{commit}",
+        ):
+            return CommandResult(0, f"{self.remote_dev}\n{self.remote_release}\n", "")
         if command[:3] == ("git", "merge-base", "--is-ancestor"):
-            is_ancestor = self.release_contains_dev or command[3] == command[4]
+            if self.release_object_requires_fetch and not self.promotion_refs_fetched:
+                return CommandResult(128, "", "fatal: Not a valid commit name")
+            is_ancestor = self.release_contains_dev or self.remote_dev == self.remote_release
             return CommandResult(0 if is_ancestor else 1, "", "")
         if command == ("git", "check-ignore", "-q", ".claude/worktrees"):
             return CommandResult(0, "", "")
@@ -225,6 +246,7 @@ def prepared_operator(
     pending_check_outcome=None,
     no_checks=False,
     release_contains_dev=False,
+    release_object_requires_fetch=False,
     merge_conflict=False,
     dirty_worktree=False,
     push_rejected=False,
@@ -249,6 +271,7 @@ def prepared_operator(
         pending_check_outcome=pending_check_outcome,
         no_checks=no_checks,
         release_contains_dev=release_contains_dev,
+        release_object_requires_fetch=release_object_requires_fetch,
         merge_conflict=merge_conflict,
         dirty_worktree=dirty_worktree,
         push_rejected=push_rejected,
@@ -585,6 +608,35 @@ class PrepareTests(unittest.TestCase):
         self.assertFalse(
             any(call.args[:3] == ("gh", "pr", "list") for call in operator.runner.calls)
         )
+
+    def test_prepare_fetches_an_advanced_release_before_checking_ancestry(self):
+        operator, batch = prepared_operator(
+            submodule_changed=False,
+            release_contains_dev=True,
+            release_object_requires_fetch=True,
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        batch["apps"]["pocket-manage"]["release_sha"] = "o" * 40
+        operator.store.save(batch)
+
+        result = operator.prepare(batch["batch_id"])
+
+        calls = command_args(operator.runner.calls)
+        fetch = [
+            "git",
+            "fetch",
+            "origin",
+            "+refs/heads/dev:refs/remotes/origin/dev",
+            "+refs/heads/release:refs/remotes/origin/release",
+        ]
+        fetch_index = calls.index(fetch)
+        ancestry_index = next(
+            index
+            for index, command in enumerate(calls)
+            if command[:3] == ["git", "merge-base", "--is-ancestor"]
+        )
+        self.assertLess(fetch_index, ancestry_index)
+        self.assertEqual(result["apps"]["pocket-manage"]["status"], "skipped")
 
     def test_prepare_records_rejected_dev_push(self):
         operator, batch = prepared_operator(push_rejected=True)

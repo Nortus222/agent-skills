@@ -426,9 +426,30 @@ class ReleaseOperator:
         dry_run: bool,
     ) -> None:
         repository_path = Path(app_record["repository_path"])
-        dev_sha = self._remote_branch_sha(app, app.dev_branch, repository_path)
-        release_sha = self._remote_branch_sha(app, app.release_branch, repository_path)
-        ancestry_command = ["git", "merge-base", "--is-ancestor", dev_sha, release_sha]
+        dev_ref = f"refs/remotes/origin/{app.dev_branch}"
+        release_ref = f"refs/remotes/origin/{app.release_branch}"
+        self._run(
+            [
+                "git",
+                "fetch",
+                "origin",
+                _remote_tracking_refspec(app.dev_branch),
+                _remote_tracking_refspec(app.release_branch),
+            ],
+            cwd=repository_path,
+            repository=app.repository,
+        )
+        branch_shas = self._run(
+            ["git", "rev-parse", f"{dev_ref}^{{commit}}", f"{release_ref}^{{commit}}"],
+            cwd=repository_path,
+            repository=app.repository,
+        ).stdout.splitlines()
+        if len(branch_shas) != 2 or not all(_is_sha(value) for value in branch_shas):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid fetched development or release branch"
+            )
+        _, release_sha = branch_shas
+        ancestry_command = ["git", "merge-base", "--is-ancestor", dev_ref, release_ref]
         ancestry = self.runner.run(ancestry_command, cwd=repository_path, mutates=False)
         if ancestry.returncode not in {0, 1}:
             command = self._redact(shlex.join(ancestry_command))
