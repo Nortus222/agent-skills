@@ -1,3 +1,4 @@
+import base64
 import copy
 import json
 import sys
@@ -14,8 +15,10 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 from mobile_release_lib import (
     BatchStore,
     CommandResult,
+    PollPolicy,
     ReleaseError,
     ReleaseOperator,
+    approval_rows,
     load_inventory,
     new_batch,
 )
@@ -140,6 +143,39 @@ class PreparationRunner:
             return CommandResult(0, output, "")
         if command[:3] == ("git", "worktree", "remove"):
             return CommandResult(0, "", "")
+        if command[:3] == ("gh", "run", "list"):
+            return CommandResult(
+                0,
+                json.dumps(
+                    [
+                        {
+                            "databaseId": 91,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "headSha": self.remote_release,
+                            "url": "https://github.com/example/actions/runs/91",
+                        }
+                    ]
+                ),
+                "",
+            )
+        if command[:3] == ("gh", "pr", "list") and "--label" in command:
+            return CommandResult(
+                0,
+                json.dumps(
+                    [
+                        {
+                            "number": 42,
+                            "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/42",
+                            "headRefOid": "a" * 40,
+                            "baseRefName": "release",
+                            "labels": [{"name": "autorelease: pending"}],
+                            "statusCheckRollup": [],
+                        }
+                    ]
+                ),
+                "",
+            )
         if command[:3] == ("gh", "pr", "list"):
             pull_requests = []
             if self.existing_pr or self.duplicate_pr:
@@ -225,7 +261,141 @@ class PreparationRunner:
         if command[:3] == ("gh", "pr", "merge"):
             self.remote_release = "m" * 40
             return CommandResult(0, "", "")
+        if command[:2] == ("gh", "api"):
+            content = base64.b64encode(json.dumps({".": "2.7.0"}).encode()).decode()
+            return CommandResult(
+                0,
+                json.dumps({"type": "file", "encoding": "base64", "content": content}),
+                "",
+            )
         raise AssertionError(f"unexpected command: {args}")
+
+
+class DiscoveryRunner:
+    def __init__(
+        self,
+        *,
+        no_release_pr_for=None,
+        workflow_statuses=None,
+        wrap_manifest_content=False,
+        duplicate_release_pr=False,
+    ):
+        self.calls = []
+        self.no_release_pr_for = no_release_pr_for
+        self.workflow_statuses = deque(workflow_statuses or ["completed"])
+        self.last_workflow_status = self.workflow_statuses[-1]
+        self.wrap_manifest_content = wrap_manifest_content
+        self.duplicate_release_pr = duplicate_release_pr
+        self.versions = {
+            "MarketplaceSoftware/pocketmanage": "2.7.0",
+            "MarketplaceSoftware/pocketmanage_installers": "1.3.0",
+            "MarketplaceSoftware/pocketmanage_partner": "4.2.1",
+        }
+
+    def run(self, args, *, cwd=None, mutates=False):
+        self.calls.append(RecordedCall(tuple(args), cwd, mutates))
+        command = tuple(args)
+        repository = command[command.index("--repo") + 1] if "--repo" in command else None
+
+        if command[:3] == ("gh", "run", "list"):
+            status = (
+                self.workflow_statuses.popleft()
+                if self.workflow_statuses
+                else self.last_workflow_status
+            )
+            return CommandResult(
+                0,
+                json.dumps(
+                    [
+                        {
+                            "databaseId": 91,
+                            "status": status,
+                            "conclusion": "success" if status == "completed" else None,
+                            "headSha": "r" * 40,
+                            "url": f"https://github.com/{repository}/actions/runs/91",
+                        }
+                    ]
+                ),
+                "",
+            )
+        if command[:3] == ("gh", "pr", "list"):
+            app_key = next(
+                key
+                for key, app in load_inventory(
+                    SKILL_ROOT / "references/apps.json"
+                ).apps.items()
+                if app.repository == repository
+            )
+            if app_key == self.no_release_pr_for:
+                return CommandResult(0, "[]", "")
+            pull_request = {
+                "number": 42,
+                "url": f"https://github.com/{repository}/pull/42",
+                "headRefOid": "a" * 40,
+                "baseRefName": "release",
+                "labels": [{"name": "autorelease: pending"}],
+                "statusCheckRollup": [
+                    {"name": "release-please", "conclusion": "SUCCESS"}
+                ],
+            }
+            pull_requests = [pull_request]
+            if self.duplicate_release_pr:
+                pull_requests.append({**pull_request, "number": 43})
+            return CommandResult(0, json.dumps(pull_requests), "")
+        if command[:2] == ("gh", "api"):
+            repository = command[2].split("/contents/", 1)[0].removeprefix("repos/")
+            manifest = json.dumps({".": self.versions[repository]}).encode()
+            content = base64.b64encode(manifest).decode()
+            if self.wrap_manifest_content:
+                content = "\n".join((content[:8], content[8:]))
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "type": "file",
+                        "encoding": "base64",
+                        "content": content,
+                    }
+                ),
+                "",
+            )
+        raise AssertionError(f"unexpected command: {args}")
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def operator_after_preparation(*, no_release_pr_for=None):
+    temporary = tempfile.TemporaryDirectory()
+    store = RecordingBatchStore(Path(temporary.name) / "state")
+    inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+    runner = DiscoveryRunner(no_release_pr_for=no_release_pr_for)
+    operator = ReleaseOperator(inventory, store, runner=runner, environ={})
+    operator._test_temporary_directory = temporary
+    app_keys = ["installers", "partner"] if no_release_pr_for else ["pocket-manage"]
+    batch = new_batch(app_keys, now="2026-08-14T12:00:00Z")
+    batch["state"] = "prepare-complete"
+    for app_key in app_keys:
+        app = inventory.apps[app_key]
+        batch["apps"][app_key] = {
+            "state": "prepare-complete",
+            "status": "prepared",
+            "repository": app.repository,
+            "release_sha": "r" * 40,
+            "packages_sha": "p" * 40,
+        }
+    store.save(batch)
+    return operator, batch
 
 
 def command_args(calls):
@@ -565,6 +735,15 @@ class PreflightTests(unittest.TestCase):
 
 
 class PrepareTests(unittest.TestCase):
+    def test_prepare_discovers_versions_after_successful_non_dry_run(self):
+        operator, batch = prepared_operator(existing_pr=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"])
+
+        self.assertEqual(result["state"], "awaiting-approval")
+        self.assertEqual(result["apps"]["pocket-manage"]["version"], "2.7.0")
+
     def test_prepare_pushes_only_changed_packages_pointer_to_dev(self):
         operator, batch = prepared_operator(submodule_changed=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -748,7 +927,7 @@ class PrepareTests(unittest.TestCase):
 
         result = operator.prepare(batch["batch_id"])
 
-        self.assertEqual(result["state"], "prepare-complete")
+        self.assertEqual(result["state"], "awaiting-approval")
         self.assertEqual(result["apps"]["pocket-manage"]["status"], "prepared")
         self.assertFalse(any(call.mutates for call in operator.runner.calls))
 
@@ -826,3 +1005,96 @@ class PrepareTests(unittest.TestCase):
             if call.args == ("git", "push", "origin", "HEAD:dev")
         ]
         self.assertEqual(pushes, [])
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_discover_versions_reads_manifest_at_release_pr_head(self):
+        operator, batch = operator_after_preparation()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.discover_versions(batch)
+
+        app = result["apps"]["pocket-manage"]
+        self.assertEqual(app["version"], "2.7.0")
+        self.assertEqual(app["release_pr_head_sha"], "a" * 40)
+        self.assertEqual(result["state"], "awaiting-approval")
+
+    def test_no_release_pr_is_a_nonblocking_reported_skip(self):
+        operator, batch = operator_after_preparation(no_release_pr_for="partner")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.discover_versions(batch)
+
+        self.assertEqual(
+            result["apps"]["partner"]["skip_reason"],
+            "no releasable changes",
+        )
+        self.assertEqual(result["apps"]["installers"]["version"], "1.3.0")
+
+    def test_approval_rows_include_complete_release_snapshot_data(self):
+        operator, batch = operator_after_preparation()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        result = operator.discover_versions(batch)
+
+        self.assertEqual(
+            approval_rows(result),
+            [
+                {
+                    "app": "pocket-manage",
+                    "version": "2.7.0",
+                    "pr_number": 42,
+                    "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/42",
+                    "checks": [
+                        {"name": "release-please", "conclusion": "SUCCESS"}
+                    ],
+                    "head_sha": "a" * 40,
+                    "submodule_sha": "p" * 40,
+                    "result": "ready for approval",
+                }
+            ],
+        )
+
+    def test_discovery_polls_with_injected_clock_until_workflow_completes(self):
+        operator, batch = operator_after_preparation()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        clock = FakeClock()
+        operator.clock = clock
+        operator.poll_policy = PollPolicy(interval_seconds=2, timeout_seconds=10)
+        operator.runner.workflow_statuses = deque(["queued", "in_progress", "completed"])
+        operator.runner.last_workflow_status = "completed"
+
+        result = operator.discover_versions(batch)
+
+        self.assertEqual(result["apps"]["pocket-manage"]["version"], "2.7.0")
+        self.assertEqual(clock.sleeps, [2, 2])
+
+    def test_discovery_times_out_without_waiting_in_real_time(self):
+        operator, batch = operator_after_preparation()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        clock = FakeClock()
+        operator.clock = clock
+        operator.poll_policy = PollPolicy(interval_seconds=2, timeout_seconds=4)
+        operator.runner.workflow_statuses = deque(["queued"])
+        operator.runner.last_workflow_status = "queued"
+
+        with self.assertRaisesRegex(ReleaseError, "timed out"):
+            operator.discover_versions(batch)
+
+        self.assertEqual(clock.sleeps, [2, 2])
+
+    def test_discovery_decodes_line_wrapped_github_content(self):
+        operator, batch = operator_after_preparation()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        operator.runner.wrap_manifest_content = True
+
+        result = operator.discover_versions(batch)
+
+        self.assertEqual(result["apps"]["pocket-manage"]["version"], "2.7.0")
+
+    def test_discovery_rejects_duplicate_release_please_pull_requests(self):
+        operator, batch = operator_after_preparation()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        operator.runner.duplicate_release_pr = True
+
+        with self.assertRaisesRegex(ReleaseError, "duplicate Release Please"):
+            operator.discover_versions(batch)

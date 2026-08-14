@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
 import shlex
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +41,26 @@ class Runner(Protocol):
         cwd: Path | None = None,
         mutates: bool = False,
     ) -> CommandResult: ...
+
+
+class Clock(Protocol):
+    def monotonic(self) -> float: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+
+class SystemClock:
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+@dataclass(frozen=True)
+class PollPolicy:
+    interval_seconds: float = 5.0
+    timeout_seconds: float = 300.0
 
 
 class SubprocessRunner:
@@ -153,11 +176,15 @@ class ReleaseOperator:
         *,
         runner: Runner | None = None,
         environ: Mapping[str, str] | None = None,
+        clock: Clock | None = None,
+        poll_policy: PollPolicy | None = None,
     ) -> None:
         self.inventory = inventory
         self.store = store
         self.runner = runner or SubprocessRunner()
         self.environ = dict(os.environ if environ is None else environ)
+        self.clock = clock or SystemClock()
+        self.poll_policy = poll_policy or PollPolicy()
 
     def preflight(self, app_keys: Sequence[str], dry_run: bool = False) -> dict[str, Any]:
         selected_apps = list(app_keys)
@@ -225,7 +252,203 @@ class ReleaseOperator:
         batch["state"] = "dry-run-complete" if dry_run else "prepare-complete"
         if not dry_run:
             self.store.save(batch)
+            return self.discover_versions(batch)
         return batch
+
+    def discover_versions(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Snapshot Release Please proposals for one human approval decision."""
+        if batch.get("state") not in {"prepare-complete", "awaiting-approval"}:
+            raise ReleaseError(
+                f"batch {batch.get('batch_id', '<unknown>')}: version discovery is not allowed "
+                "from its current state"
+            )
+
+        for app_key in batch["selected_apps"]:
+            app = self.inventory.apps[app_key]
+            app_record = batch["apps"][app_key]
+            if app_record.get("skip_reason"):
+                continue
+            if app_record.get("status") != "prepared":
+                raise ReleaseError(
+                    f"repository {app.repository}: preparation is incomplete"
+                )
+
+            self._wait_for_release_workflow(app, app_record["release_sha"])
+            pull_requests = self._list_release_pull_requests(app)
+            if not pull_requests:
+                app_record.update(
+                    {
+                        "state": "awaiting-approval",
+                        "status": "skipped",
+                        "skip_reason": "no releasable changes",
+                        "result": "no releasable changes",
+                    }
+                )
+                self.store.save(batch)
+                continue
+
+            pull_request = pull_requests[0]
+            head_sha = pull_request.get("headRefOid")
+            if not _is_sha(head_sha or ""):
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid Release Please pull request head"
+                )
+            version = self._manifest_version_at_head(app, head_sha)
+            app_record.update(
+                {
+                    "state": "awaiting-approval",
+                    "status": "prepared",
+                    "version": version,
+                    "release_pr_number": pull_request["number"],
+                    "release_pr_url": pull_request["url"],
+                    "release_pr_checks": pull_request.get("statusCheckRollup", []),
+                    "release_pr_head_sha": head_sha,
+                    "submodule_sha": app_record["packages_sha"],
+                    "result": "ready for approval",
+                }
+            )
+            self.store.save(batch)
+
+        batch["state"] = "awaiting-approval"
+        self.store.save(batch)
+        return batch
+
+    def _wait_for_release_workflow(self, app: AppConfig, release_sha: str) -> None:
+        deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
+        command = [
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            app.repository,
+            "--commit",
+            release_sha,
+            "--workflow",
+            "release-please",
+            "--limit",
+            "1",
+            "--json",
+            "databaseId,status,conclusion,headSha,url",
+        ]
+        while True:
+            runs = self._load_json(
+                self._run(command, repository=app.repository).stdout,
+                repository=app.repository,
+                subject="Release Please workflow response",
+            )
+            if not isinstance(runs, list) or len(runs) > 1 or not all(
+                isinstance(run, dict) for run in runs
+            ):
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid Release Please workflow response"
+                )
+            if runs:
+                run = runs[0]
+                if run.get("headSha") != release_sha:
+                    raise ReleaseError(
+                        f"repository {app.repository}: unexpected Release Please workflow commit"
+                    )
+                if run.get("status") == "completed":
+                    if run.get("conclusion") != "success":
+                        raise ReleaseError(
+                            f"repository {app.repository}: Release Please workflow failed"
+                        )
+                    return
+            if self.clock.monotonic() >= deadline:
+                raise ReleaseError(
+                    f"repository {app.repository}: timed out waiting for Release Please workflow"
+                )
+            self.clock.sleep(self.poll_policy.interval_seconds)
+
+    def _list_release_pull_requests(self, app: AppConfig) -> list[dict[str, Any]]:
+        pull_requests = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "pr",
+                    "list",
+                    "--repo",
+                    app.repository,
+                    "--state",
+                    "open",
+                    "--base",
+                    app.release_branch,
+                    "--label",
+                    app.release_label,
+                    "--json",
+                    "number,url,headRefOid,baseRefName,labels,statusCheckRollup",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="Release Please pull request response",
+        )
+        if not isinstance(pull_requests, list) or not all(
+            isinstance(item, dict) for item in pull_requests
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid Release Please pull request response"
+            )
+        if len(pull_requests) > 1:
+            raise ReleaseError(
+                f"repository {app.repository}: duplicate Release Please pull requests"
+            )
+        if pull_requests:
+            pull_request = pull_requests[0]
+            labels = pull_request.get("labels")
+            if (
+                not isinstance(pull_request.get("number"), int)
+                or not isinstance(pull_request.get("url"), str)
+                or pull_request.get("baseRefName") != app.release_branch
+                or not isinstance(labels, list)
+                or app.release_label
+                not in {
+                    label.get("name")
+                    for label in labels
+                    if isinstance(label, dict)
+                }
+                or not isinstance(pull_request.get("statusCheckRollup", []), list)
+            ):
+                raise ReleaseError(
+                    f"repository {app.repository}: unexpected Release Please pull request"
+                )
+        return pull_requests
+
+    def _manifest_version_at_head(self, app: AppConfig, head_sha: str) -> str:
+        response = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{app.repository}/contents/{app.release_manifest}?ref={head_sha}",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="release manifest response",
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("type") != "file"
+            or response.get("encoding") != "base64"
+            or not isinstance(response.get("content"), str)
+        ):
+            raise ReleaseError(f"repository {app.repository}: invalid release manifest response")
+        try:
+            encoded = "".join(response["content"].split())
+            content = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as error:
+            raise ReleaseError(
+                f"repository {app.repository}: invalid release manifest content"
+            ) from error
+        manifest = self._load_json(
+            content,
+            repository=app.repository,
+            subject="release manifest content",
+        )
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("."), str):
+            raise ReleaseError(f"repository {app.repository}: missing release manifest version")
+        return manifest["."]
 
     @staticmethod
     def _initialize_preparation_record(app_record: dict[str, Any]) -> None:
@@ -926,6 +1149,26 @@ class ReleaseOperator:
             return json.loads(value)
         except json.JSONDecodeError as error:
             raise ReleaseError(f"repository {repository}: invalid {subject}") from error
+
+
+def approval_rows(batch: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return plain approval data suitable for JSON or human formatting."""
+    rows = []
+    for app_key in batch["selected_apps"]:
+        app = batch["apps"][app_key]
+        rows.append(
+            {
+                "app": app_key,
+                "version": app.get("version"),
+                "pr_number": app.get("release_pr_number"),
+                "url": app.get("release_pr_url"),
+                "checks": app.get("release_pr_checks", []),
+                "head_sha": app.get("release_pr_head_sha"),
+                "submodule_sha": app.get("submodule_sha", app.get("packages_sha")),
+                "result": app.get("result", app.get("skip_reason")),
+            }
+        )
+    return rows
 
 
 def _normalize_repository(value: str) -> str:
