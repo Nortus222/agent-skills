@@ -84,8 +84,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(document["batch_id"], "batch-1")
         self.assertEqual(
             document["next_command"],
-            "mobile_release.py prepare --batch batch-1",
+            "python scripts/mobile_release.py preflight --json",
         )
+        self.assertIn("dry-run preflight was not saved", document["warnings"])
 
     def test_partial_batch_warning_is_printed_before_preflight(self):
         with mock.patch.object(mobile_release, "build_operator") as factory:
@@ -120,23 +121,65 @@ class CliTests(unittest.TestCase):
         self.assertIn("release-please=SUCCESS", output)
         self.assertIn(f"submodule={'b' * 40}", output)
         self.assertIn("preserved worktree /tmp/preserved", output)
-        self.assertIn("mobile_release.py release --batch batch-1", output)
+        self.assertIn(
+            "python scripts/mobile_release.py release --batch batch-1", output
+        )
 
-    def test_release_error_prints_the_saved_recovery_summary(self):
+    def test_release_error_prints_one_json_recovery_document(self):
         with mock.patch.object(mobile_release, "build_operator") as factory:
             operator = factory.return_value
             operator.release.side_effect = ReleaseError("approval snapshot changed")
             operator.status.return_value = self._batch()
+            stdout = io.StringIO()
             stderr = io.StringIO()
-            with mock.patch("sys.stderr", stderr):
+            with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
                 result = mobile_release.main(
                     ["release", "--batch", "batch-1", "--json"]
                 )
 
         self.assertEqual(result, 1)
-        self.assertIn("approval snapshot changed", stderr.getvalue())
-        self.assertIn("Batch: batch-1", stderr.getvalue())
-        self.assertIn("Next command:", stderr.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["error"], "approval snapshot changed")
+        self.assertEqual(document["recovery"]["batch_id"], "batch-1")
+        self.assertEqual(document["recovery"]["state"], "awaiting-approval")
+        self.assertEqual(
+            document["recovery"]["next_command"],
+            "python scripts/mobile_release.py release --batch batch-1",
+        )
+
+    def test_preflight_json_error_has_null_recovery_without_a_saved_batch(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.inventory.apps = {"pocket-manage": object()}
+            operator.preflight.side_effect = ReleaseError("authentication failed")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+                result = mobile_release.main(["preflight", "--json"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"error": "authentication failed", "recovery": None},
+        )
+
+    def test_next_commands_match_the_skill_invocation(self):
+        expected = {
+            "preflight-complete": "python scripts/mobile_release.py prepare --batch batch-1",
+            "dry-run-complete": "python scripts/mobile_release.py prepare --batch batch-1",
+            "awaiting-approval": "python scripts/mobile_release.py release --batch batch-1",
+            "partial-release": "python scripts/mobile_release.py release --batch batch-1",
+            "release-failed": "python scripts/mobile_release.py release --batch batch-1",
+            "released-builds-unverified": "python scripts/mobile_release.py status --batch batch-1",
+        }
+
+        for state, command in expected.items():
+            with self.subTest(state=state):
+                document = mobile_release._summary_document(self._batch(state))
+                self.assertEqual(document["next_command"], command)
 
     def test_keyboard_interrupt_returns_130_without_inventing_progress(self):
         with mock.patch.object(mobile_release, "build_operator") as factory:
