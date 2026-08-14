@@ -313,6 +313,478 @@ class ReleaseOperator:
         self.store.save(batch)
         return batch
 
+    def release(self, batch_id: str) -> dict[str, Any]:
+        """Merge an unchanged approval snapshot and verify release build startup."""
+        batch = self.store.load(batch_id)
+        allowed_states = {
+            "awaiting-approval",
+            "partial-release",
+            "release-failed",
+            "released-builds-unverified",
+        }
+        if batch.get("state") not in allowed_states:
+            raise ReleaseError(
+                f"batch {batch_id}: release is not allowed from its current state"
+            )
+
+        included = [
+            app_key
+            for app_key in batch["selected_apps"]
+            if not batch["apps"][app_key].get("skip_reason")
+        ]
+        unfinished = []
+        approval_changed = False
+        for app_key in included:
+            app = self.inventory.apps[app_key]
+            app_record = batch["apps"][app_key]
+            release_merge = app_record.get("release_merge")
+            if release_merge in {"merged", "merge-unverified"}:
+                merge_sha = self._confirm_recorded_release_merge(
+                    app,
+                    app_record,
+                    require_recorded_sha=release_merge == "merged",
+                )
+                if release_merge == "merge-unverified":
+                    app_record.update(
+                        {
+                            "release_merge": "merged",
+                            "release_merge_sha": merge_sha,
+                            "state": "release-merged",
+                            "status": "released",
+                            "error": None,
+                            "result": "Release Please pull request merged",
+                        }
+                    )
+                    self.store.save(batch)
+                continue
+
+            snapshot = self._current_release_snapshot(app, app_record)
+            if not self._approval_snapshot_matches(app, app_record, snapshot):
+                self._replace_approval_snapshot(app_record, snapshot)
+                approval_changed = True
+            unfinished.append((app, app_record))
+
+        if approval_changed:
+            batch["state"] = "awaiting-approval"
+            self.store.save(batch)
+            raise ReleaseError(
+                f"batch {batch_id}: approval snapshot changed; review and approve again"
+            )
+
+        for app, app_record in unfinished:
+            number = str(app_record["release_pr_number"])
+            merge_command = [
+                "gh",
+                "pr",
+                "merge",
+                number,
+                "--repo",
+                app.repository,
+                "--merge",
+            ]
+            merge_result = self.runner.run(merge_command, mutates=True)
+            if merge_result.returncode != 0:
+                self._record_release_failure(
+                    batch,
+                    app_record,
+                    self._command_error(app.repository, merge_command, merge_result),
+                )
+
+            app_record.update(
+                {
+                    "release_merge": "merge-unverified",
+                    "state": "release-merge-unverified",
+                    "status": "pending",
+                    "result": "Release Please merge confirmation pending",
+                }
+            )
+            self.store.save(batch)
+            try:
+                merged_pull_request = self._read_release_pull_request(app, number)
+                merge_sha = self._merged_pull_request_sha(app, merged_pull_request)
+            except ReleaseError as error:
+                app_record["error"] = str(error)
+                batch["state"] = "partial-release"
+                self.store.save(batch)
+                raise ReleaseError(
+                    f"batch {batch_id}: partial release: {error}"
+                ) from error
+
+            app_record.update(
+                {
+                    "release_merge": "merged",
+                    "release_merge_sha": merge_sha,
+                    "state": "release-merged",
+                    "status": "released",
+                    "error": None,
+                    "result": "Release Please pull request merged",
+                }
+            )
+            self.store.save(batch)
+
+        builds_unverified = False
+        for app_key in included:
+            app = self.inventory.apps[app_key]
+            app_record = batch["apps"][app_key]
+            try:
+                verified = self._verify_release(batch, app, app_record)
+            except ReleaseError as error:
+                app_record.update(
+                    {
+                        "state": "release-failed",
+                        "status": "failed",
+                        "error": str(error),
+                    }
+                )
+                batch["state"] = "release-failed"
+                self.store.save(batch)
+                raise
+            builds_unverified = builds_unverified or not verified
+            self.store.save(batch)
+
+        batch["state"] = (
+            "released-builds-unverified" if builds_unverified else "released"
+        )
+        self.store.save(batch)
+        return batch
+
+    def status(self, batch_id: str) -> dict[str, Any]:
+        """Load persisted batch status without querying or changing remote state."""
+        return self.store.load(batch_id)
+
+    def _current_release_snapshot(
+        self, app: AppConfig, app_record: dict[str, Any]
+    ) -> dict[str, Any]:
+        pull_request = self._read_release_pull_request(
+            app, str(app_record["release_pr_number"])
+        )
+        head_sha = pull_request.get("headRefOid")
+        version = None
+        if isinstance(head_sha, str) and _is_sha(head_sha):
+            version = self._manifest_version_at_head(app, head_sha)
+        return {
+            "repository": app.repository,
+            "release_pr_number": pull_request.get("number"),
+            "release_pr_url": pull_request.get("url"),
+            "release_pr_state": pull_request.get("state"),
+            "release_pr_base": pull_request.get("baseRefName"),
+            "release_pr_labels": pull_request.get("labels", []),
+            "release_pr_checks": pull_request.get("statusCheckRollup", []),
+            "release_pr_head_sha": head_sha,
+            "version": version,
+        }
+
+    def _read_release_pull_request(
+        self, app: AppConfig, number: str
+    ) -> dict[str, Any]:
+        response = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    number,
+                    "--repo",
+                    app.repository,
+                    "--json",
+                    "number,url,state,headRefOid,baseRefName,labels,statusCheckRollup,mergeCommit",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="Release Please pull request response",
+        )
+        if not isinstance(response, dict):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid Release Please pull request response"
+            )
+        return response
+
+    @staticmethod
+    def _approval_snapshot_matches(
+        app: AppConfig,
+        app_record: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> bool:
+        labels = snapshot["release_pr_labels"]
+        label_names = {
+            label.get("name") for label in labels if isinstance(label, dict)
+        } if isinstance(labels, list) else set()
+        checks = snapshot["release_pr_checks"]
+        return (
+            app_record.get("repository") == app.repository
+            and snapshot["release_pr_number"] == app_record.get("release_pr_number")
+            and snapshot["release_pr_state"] == "OPEN"
+            and snapshot["release_pr_base"] == app.release_branch
+            and app.release_label in label_names
+            and snapshot["version"] == app_record.get("version")
+            and snapshot["release_pr_head_sha"]
+            == app_record.get("release_pr_head_sha")
+            and checks == app_record.get("release_pr_checks")
+            and _release_checks_pass(checks)
+        )
+
+    @staticmethod
+    def _replace_approval_snapshot(
+        app_record: dict[str, Any], snapshot: dict[str, Any]
+    ) -> None:
+        app_record.update(snapshot)
+        app_record.update(
+            {
+                "state": "awaiting-approval",
+                "status": "prepared",
+                "result": "approval snapshot changed",
+            }
+        )
+
+    def _confirm_recorded_release_merge(
+        self,
+        app: AppConfig,
+        app_record: dict[str, Any],
+        *,
+        require_recorded_sha: bool = True,
+    ) -> str:
+        pull_request = self._read_release_pull_request(
+            app, str(app_record["release_pr_number"])
+        )
+        merge_sha = self._merged_pull_request_sha(app, pull_request)
+        if require_recorded_sha and merge_sha != app_record.get("release_merge_sha"):
+            raise ReleaseError(
+                f"repository {app.repository}: recorded release merge changed"
+            )
+        return merge_sha
+
+    @staticmethod
+    def _merged_pull_request_sha(
+        app: AppConfig, pull_request: dict[str, Any]
+    ) -> str:
+        merge_commit = pull_request.get("mergeCommit")
+        merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        if pull_request.get("state") != "MERGED" or not isinstance(
+            merge_sha, str
+        ) or not _is_sha(merge_sha):
+            raise ReleaseError(
+                f"repository {app.repository}: Release Please merge was not confirmed"
+            )
+        return merge_sha
+
+    def _record_release_failure(
+        self,
+        batch: dict[str, Any],
+        app_record: dict[str, Any],
+        error: str,
+    ) -> None:
+        app_record.update(
+            {
+                "release_merge": "failed",
+                "state": "release-failed",
+                "status": "failed",
+                "error": error,
+            }
+        )
+        partial = any(
+            record.get("release_merge") == "merged"
+            for record in batch["apps"].values()
+        )
+        batch["state"] = "partial-release" if partial else "release-failed"
+        self.store.save(batch)
+        description = "partial release" if partial else "release failed"
+        raise ReleaseError(f"batch {batch['batch_id']}: {description}: {error}")
+
+    def _verify_release(
+        self,
+        batch: dict[str, Any],
+        app: AppConfig,
+        app_record: dict[str, Any],
+    ) -> bool:
+        version = app_record["version"]
+        tag = f"v{version}"
+        merge_sha = app_record["release_merge_sha"]
+        tag_commit_sha = self._resolve_tag_commit(app, tag)
+        if tag_commit_sha != merge_sha:
+            raise ReleaseError(
+                f"repository {app.repository}: tag does not match release merge"
+            )
+
+        release_result = self.runner.run(
+            [
+                "gh",
+                "release",
+                "view",
+                tag,
+                "--repo",
+                app.repository,
+                "--json",
+                "tagName,url",
+            ],
+            mutates=False,
+        )
+        if release_result.returncode != 0:
+            raise ReleaseError(
+                f"repository {app.repository}: matching GitHub release is unavailable"
+            )
+        release = self._load_json(
+            release_result.stdout,
+            repository=app.repository,
+            subject="GitHub release response",
+        )
+        if (
+            not isinstance(release, dict)
+            or release.get("tagName") != tag
+            or not isinstance(release.get("url"), str)
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: invalid matching GitHub release"
+            )
+
+        app_record.update(
+            {
+                "tag": tag,
+                "tag_commit_sha": tag_commit_sha,
+                "tag_url": release["url"],
+                "commit_url": f"https://github.com/{app.repository}/commit/{tag_commit_sha}",
+            }
+        )
+        self.store.save(batch)
+        checks = self._wait_for_codemagic_checks(app, tag_commit_sha)
+        if checks is None:
+            app_record.update(
+                {
+                    "build_verification": "unverified",
+                    "codemagic_checks": {},
+                    "state": "released-builds-unverified",
+                    "status": "released",
+                    "result": "released; CodeMagic build startup unverified",
+                }
+            )
+            return False
+
+        app_record.update(
+            {
+                "build_verification": "verified",
+                "codemagic_checks": checks,
+                "state": "released",
+                "status": "released",
+                "error": None,
+                "result": "released; CodeMagic build checks found",
+            }
+        )
+        return True
+
+    def _resolve_tag_commit(self, app: AppConfig, tag: str) -> str:
+        reference = self._load_json(
+            self._run(
+                ["gh", "api", f"repos/{app.repository}/git/ref/tags/{tag}"],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="tag reference response",
+        )
+        if not isinstance(reference, dict) or not isinstance(
+            reference.get("object"), dict
+        ):
+            raise ReleaseError(f"repository {app.repository}: invalid tag reference")
+        target = reference["object"]
+        seen = set()
+        while target.get("type") == "tag":
+            tag_sha = target.get("sha")
+            if not isinstance(tag_sha, str) or not _is_sha(tag_sha) or tag_sha in seen:
+                raise ReleaseError(f"repository {app.repository}: invalid annotated tag")
+            seen.add(tag_sha)
+            tag_object = self._load_json(
+                self._run(
+                    ["gh", "api", f"repos/{app.repository}/git/tags/{tag_sha}"],
+                    repository=app.repository,
+                ).stdout,
+                repository=app.repository,
+                subject="annotated tag response",
+            )
+            if not isinstance(tag_object, dict) or not isinstance(
+                tag_object.get("object"), dict
+            ):
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid annotated tag"
+                )
+            target = tag_object["object"]
+        commit_sha = target.get("sha")
+        if target.get("type") != "commit" or not isinstance(
+            commit_sha, str
+        ) or not _is_sha(commit_sha):
+            raise ReleaseError(f"repository {app.repository}: tag does not resolve to a commit")
+        return commit_sha
+
+    def _wait_for_codemagic_checks(
+        self, app: AppConfig, commit_sha: str
+    ) -> dict[str, dict[str, Any]] | None:
+        deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
+        command = [
+            "gh",
+            "api",
+            f"repos/{app.repository}/commits/{commit_sha}/check-runs",
+        ]
+        expected = set(self.inventory.codemagic_checks)
+        while True:
+            response = self._load_json(
+                self._run(command, repository=app.repository).stdout,
+                repository=app.repository,
+                subject="commit check run response",
+            )
+            if not isinstance(response, dict) or not isinstance(
+                response.get("check_runs"), list
+            ):
+                raise ReleaseError(
+                    f"repository {app.repository}: invalid commit check run response"
+                )
+            found = {}
+            for check in response["check_runs"]:
+                if not isinstance(check, dict):
+                    raise ReleaseError(
+                        f"repository {app.repository}: invalid commit check run response"
+                    )
+                check_app = check.get("app")
+                name = check.get("name")
+                if (
+                    not isinstance(check_app, dict)
+                    or check_app.get("name") != "Codemagic CI/CD"
+                    or name not in expected
+                ):
+                    continue
+                status = check.get("status")
+                conclusion = check.get("conclusion")
+                details_url = check.get("details_url")
+                if (
+                    not isinstance(status, str)
+                    or conclusion is not None
+                    and not isinstance(conclusion, str)
+                    or not isinstance(details_url, str)
+                ):
+                    raise ReleaseError(
+                        f"repository {app.repository}: invalid CodeMagic check run"
+                    )
+                found[name] = {
+                    "status": status,
+                    "conclusion": conclusion,
+                    "details_url": details_url,
+                }
+            if set(found) == expected:
+                return found
+            if self.clock.monotonic() >= deadline:
+                return None
+            self.clock.sleep(self.poll_policy.interval_seconds)
+
+    def _command_error(
+        self,
+        repository: str,
+        args: Sequence[str],
+        result: CommandResult,
+    ) -> str:
+        command = self._redact(shlex.join(args))
+        stderr = self._redact(result.stderr.strip()) or "no stderr"
+        return (
+            f"repository {repository}: command `{command}` failed with exit code "
+            f"{result.returncode}: {stderr}"
+        )
+
     def _wait_for_release_workflow(self, app: AppConfig, release_sha: str) -> None:
         deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
         command = [
@@ -1188,7 +1660,20 @@ def _normalize_repository(value: str) -> str:
 
 
 def _is_sha(value: str) -> bool:
-    return re.fullmatch(r"\S{40}", value.strip()) is not None
+    return re.fullmatch(r"[0-9a-fA-F]{40}", value.strip()) is not None
+
+
+def _release_checks_pass(checks: Any) -> bool:
+    return (
+        isinstance(checks, list)
+        and bool(checks)
+        and all(
+            isinstance(check, dict)
+            and str(check.get("conclusion", "")).upper()
+            in {"SUCCESS", "NEUTRAL", "SKIPPED"}
+            for check in checks
+        )
+    )
 
 
 def _remote_tracking_refspec(branch: str) -> str:

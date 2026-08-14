@@ -21,6 +21,7 @@ from mobile_release_lib import (
     approval_rows,
     load_inventory,
     new_batch,
+    _is_sha,
 )
 
 
@@ -85,7 +86,7 @@ class PreparationRunner:
         self.dirty_worktree = dirty_worktree
         self.push_rejected = push_rejected
         self.remote_dev = remote_dev or "d" * 40
-        self.remote_release = remote_release or "r" * 40
+        self.remote_release = remote_release or "e" * 40
         self.resumed = resumed
 
     def run(self, args, *, cwd=None, mutates=False):
@@ -132,11 +133,11 @@ class PreparationRunner:
         if command == ("git", "commit", "-m", "chore: update shared packages"):
             return CommandResult(0, "", "")
         if command == ("git", "rev-parse", "HEAD^{commit}"):
-            return CommandResult(0, f"{'n' * 40}\n", "")
+            return CommandResult(0, f"{'1' * 40}\n", "")
         if command == ("git", "push", "origin", "HEAD:dev"):
             if self.push_rejected:
                 return CommandResult(1, "", "non-fast-forward")
-            self.remote_dev = "n" * 40
+            self.remote_dev = "1" * 40
             return CommandResult(0, "", "")
         if command == ("git", "status", "--porcelain"):
             output = "?? unexpected.txt\n" if self.dirty_worktree else ""
@@ -259,7 +260,7 @@ class PreparationRunner:
                 "",
             )
         if command[:3] == ("gh", "pr", "merge"):
-            self.remote_release = "m" * 40
+            self.remote_release = "2" * 40
             return CommandResult(0, "", "")
         if command[:2] == ("gh", "api"):
             content = base64.b64encode(json.dumps({".": "2.7.0"}).encode()).decode()
@@ -311,7 +312,7 @@ class DiscoveryRunner:
                             "databaseId": 91,
                             "status": status,
                             "conclusion": "success" if status == "completed" else None,
-                            "headSha": "r" * 40,
+                            "headSha": "e" * 40,
                             "url": f"https://github.com/{repository}/actions/runs/91",
                         }
                     ]
@@ -362,6 +363,177 @@ class DiscoveryRunner:
         raise AssertionError(f"unexpected command: {args}")
 
 
+class ReleaseRunner:
+    def __init__(
+        self,
+        *,
+        current_head=None,
+        changed_version=False,
+        missing_label=False,
+        changed_base=False,
+        failed_checks=False,
+        second_merge_fails=False,
+        annotated_tag=False,
+        wrong_tag=False,
+        missing_release=False,
+        codemagic_checks="queued",
+        resumed_merge=False,
+        merge_confirmation_fails=False,
+    ):
+        self.calls = []
+        self.current_head = current_head
+        self.changed_version = changed_version
+        self.missing_label = missing_label
+        self.changed_base = changed_base
+        self.failed_checks = failed_checks
+        self.second_merge_fails = second_merge_fails
+        self.annotated_tag = annotated_tag
+        self.wrong_tag = wrong_tag
+        self.missing_release = missing_release
+        self.codemagic_checks = codemagic_checks
+        self.merge_confirmation_fails = merge_confirmation_fails
+        self.merged = {"MarketplaceSoftware/pocketmanage"} if resumed_merge else set()
+        self.merge_shas = {
+            "MarketplaceSoftware/pocketmanage": "4" * 40,
+            "MarketplaceSoftware/pocketmanage_installers": "5" * 40,
+            "MarketplaceSoftware/pocketmanage_partner": "6" * 40,
+        }
+
+    def run(self, args, *, cwd=None, mutates=False):
+        self.calls.append(RecordedCall(tuple(args), cwd, mutates))
+        command = tuple(args)
+        repository = command[command.index("--repo") + 1] if "--repo" in command else None
+        if command[:2] == ("gh", "api"):
+            repository_parts = command[2].removeprefix("repos/").split("/", 2)
+            repository = "/".join(repository_parts[:2])
+
+        if command[:3] == ("gh", "pr", "view"):
+            if self.merge_confirmation_fails and repository in self.merged:
+                return CommandResult(1, "", "temporary read failure")
+            head = self.current_head or "a" * 40
+            checks = [
+                {
+                    "name": "release-please",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE" if self.failed_checks else "SUCCESS",
+                }
+            ]
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "number": int(command[3]),
+                        "url": f"https://github.com/{repository}/pull/{command[3]}",
+                        "state": "MERGED" if repository in self.merged else "OPEN",
+                        "headRefOid": head,
+                        "baseRefName": "main" if self.changed_base else "release",
+                        "labels": []
+                        if self.missing_label
+                        else [{"name": "autorelease: pending"}],
+                        "statusCheckRollup": checks,
+                        "mergeCommit": {
+                            "oid": self.merge_shas[repository]
+                        }
+                        if repository in self.merged
+                        else None,
+                    }
+                ),
+                "",
+            )
+        if command[:3] == ("gh", "pr", "merge"):
+            if self.second_merge_fails and repository.endswith("_installers"):
+                return CommandResult(1, "", "merge failed")
+            self.merged.add(repository)
+            return CommandResult(0, "", "")
+        if command[:2] == ("gh", "api") and "/contents/" in command[2]:
+            version = {
+                "MarketplaceSoftware/pocketmanage": "2.7.1"
+                if self.changed_version
+                else "2.7.0",
+                "MarketplaceSoftware/pocketmanage_installers": "1.3.0",
+                "MarketplaceSoftware/pocketmanage_partner": "4.2.1",
+            }[repository]
+            content = base64.b64encode(json.dumps({".": version}).encode()).decode()
+            return CommandResult(
+                0,
+                json.dumps({"type": "file", "encoding": "base64", "content": content}),
+                "",
+            )
+        if command[:2] == ("gh", "api") and "/git/ref/tags/" in command[2]:
+            merge_sha = self.merge_shas[repository]
+            tag_sha = "7" * 40 if self.annotated_tag else merge_sha
+            if self.wrong_tag:
+                tag_sha = "8" * 40
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "ref": command[2].split("/git/ref/", 1)[1],
+                        "object": {
+                            "type": "tag" if self.annotated_tag else "commit",
+                            "sha": tag_sha,
+                            "url": f"https://api.github.com/repos/{repository}/git/{tag_sha}",
+                        },
+                    }
+                ),
+                "",
+            )
+        if command[:2] == ("gh", "api") and "/git/tags/" in command[2]:
+            target = "8" * 40 if self.wrong_tag else self.merge_shas[repository]
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "sha": "7" * 40,
+                        "object": {"type": "commit", "sha": target},
+                    }
+                ),
+                "",
+            )
+        if command[:3] == ("gh", "release", "view"):
+            if self.missing_release:
+                return CommandResult(1, "", "release not found")
+            tag = command[3]
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "tagName": tag,
+                        "url": f"https://github.com/{repository}/releases/tag/{tag}",
+                    }
+                ),
+                "",
+            )
+        if command[:2] == ("gh", "api") and "/check-runs" in command[2]:
+            check_runs = []
+            if self.codemagic_checks != "timeout":
+                names = load_inventory(
+                    SKILL_ROOT / "references/apps.json"
+                ).codemagic_checks
+                for index, name in enumerate(names):
+                    status = "completed" if self.codemagic_checks == "mixed" and index == 0 else "queued"
+                    check_runs.append(
+                        {
+                            "name": name,
+                            "status": status,
+                            "conclusion": "failure" if status == "completed" else None,
+                            "details_url": f"https://codemagic.io/app/check-{index}",
+                            "app": {"slug": "codemagic-ci-cd", "name": "Codemagic CI/CD"},
+                        }
+                    )
+                check_runs.append(
+                    {
+                        "name": names[0],
+                        "status": "completed",
+                        "conclusion": "success",
+                        "details_url": "https://example.com/wrong-app",
+                        "app": {"slug": "other", "name": "Other CI"},
+                    }
+                )
+            return CommandResult(0, json.dumps({"check_runs": check_runs}), "")
+        raise AssertionError(f"unexpected command: {args}")
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -391,9 +563,101 @@ def operator_after_preparation(*, no_release_pr_for=None):
             "state": "prepare-complete",
             "status": "prepared",
             "repository": app.repository,
-            "release_sha": "r" * 40,
-            "packages_sha": "p" * 40,
+            "release_sha": "e" * 40,
+            "packages_sha": "f" * 40,
         }
+    store.save(batch)
+    return operator, batch
+
+
+def awaiting_approval_operator(
+    *,
+    app_keys=None,
+    skipped_apps=None,
+    current_head=None,
+    changed_version=False,
+    missing_label=False,
+    changed_base=False,
+    failed_checks=False,
+    second_merge_fails=False,
+    annotated_tag=False,
+    wrong_tag=False,
+    missing_release=False,
+    codemagic_checks="queued",
+    resumed_merge=False,
+    merge_confirmation_fails=False,
+):
+    app_keys = app_keys or ["pocket-manage"]
+    skipped_apps = set(skipped_apps or [])
+    temporary = tempfile.TemporaryDirectory()
+    store = RecordingBatchStore(Path(temporary.name) / "state")
+    inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+    runner = ReleaseRunner(
+        current_head=current_head,
+        changed_version=changed_version,
+        missing_label=missing_label,
+        changed_base=changed_base,
+        failed_checks=failed_checks,
+        second_merge_fails=second_merge_fails,
+        annotated_tag=annotated_tag,
+        wrong_tag=wrong_tag,
+        missing_release=missing_release,
+        codemagic_checks=codemagic_checks,
+        resumed_merge=resumed_merge,
+        merge_confirmation_fails=merge_confirmation_fails,
+    )
+    clock = FakeClock()
+    operator = ReleaseOperator(
+        inventory,
+        store,
+        runner=runner,
+        environ={},
+        clock=clock,
+        poll_policy=PollPolicy(interval_seconds=2, timeout_seconds=4),
+    )
+    operator._test_temporary_directory = temporary
+    batch = new_batch(app_keys, now="2026-08-14T12:00:00Z")
+    batch["state"] = "partial-release" if resumed_merge else "awaiting-approval"
+    versions = {"pocket-manage": "2.7.0", "installers": "1.3.0", "partner": "4.2.1"}
+    for index, app_key in enumerate(app_keys, start=42):
+        app = inventory.apps[app_key]
+        if app_key in skipped_apps:
+            batch["apps"][app_key] = {
+                "state": "awaiting-approval",
+                "status": "skipped",
+                "repository": app.repository,
+                "skip_reason": "no releasable changes",
+                "result": "no releasable changes",
+            }
+            continue
+        batch["apps"][app_key] = {
+            "state": "awaiting-approval",
+            "status": "prepared",
+            "repository": app.repository,
+            "version": versions[app_key],
+            "release_pr_number": index,
+            "release_pr_url": f"https://github.com/{app.repository}/pull/{index}",
+            "release_pr_checks": [
+                {
+                    "name": "release-please",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                }
+            ],
+            "release_pr_head_sha": "a" * 40,
+            "submodule_sha": "f" * 40,
+            "result": "ready for approval",
+        }
+    if resumed_merge:
+        first = batch["apps"][app_keys[0]]
+        first.update(
+            {
+                "release_merge": "merged",
+                "release_merge_sha": runner.merge_shas[
+                    inventory.apps[app_keys[0]].repository
+                ],
+            }
+        )
     store.save(batch)
     return operator, batch
 
@@ -431,9 +695,9 @@ def prepared_operator(
     (repository_path / "packages").mkdir()
 
     dev_sha = "d" * 40
-    release_sha = dev_sha if no_dev_release_diff else "r" * 40
-    remote_dev = "n" * 40 if resumed else dev_sha
-    remote_release = "m" * 40 if resumed else release_sha
+    release_sha = dev_sha if no_dev_release_diff else "e" * 40
+    remote_dev = "1" * 40 if resumed else dev_sha
+    remote_release = "2" * 40 if resumed else release_sha
     runner = PreparationRunner(
         existing_pr=existing_pr,
         duplicate_pr=duplicate_pr,
@@ -466,8 +730,8 @@ def prepared_operator(
         "repository_path": str(repository_path.resolve()),
         "dev_sha": dev_sha,
         "release_sha": release_sha,
-        "packages_pointer_sha": "c" * 40 if submodule_changed else "p" * 40,
-        "packages_sha": "p" * 40,
+        "packages_pointer_sha": "c" * 40 if submodule_changed else "f" * 40,
+        "packages_sha": "f" * 40,
         "dev_to_release_pr": None,
     }
     if resumed:
@@ -476,7 +740,7 @@ def prepared_operator(
             {
                 "worktree": None,
                 "submodule_before": "c" * 40,
-                "submodule_after": "p" * 40,
+                "submodule_after": "f" * 40,
                 "dev_push": "pushed",
                 "preparation_pr": {
                     "number": 17,
@@ -503,11 +767,11 @@ def successful_preflight_responses(app_count=3):
         responses.extend(
             [
                 CommandResult(0, "", ""),
-                CommandResult(0, f"{'d' * 40}\n{'r' * 40}\n", ""),
+                CommandResult(0, f"{'d' * 40}\n{'e' * 40}\n", ""),
                 CommandResult(0, f"160000 commit {'c' * 40}\tpackages\n", ""),
                 CommandResult(0, "git@github.com:MarketplaceSoftware/packages.git\n", ""),
                 CommandResult(0, "", ""),
-                CommandResult(0, f"{'p' * 40}\n", ""),
+                CommandResult(0, f"{'f' * 40}\n", ""),
                 CommandResult(0, "{}\n{}\n", ""),
                 CommandResult(
                     0,
@@ -576,6 +840,12 @@ class InventoryTests(unittest.TestCase):
             self.assertEqual(store.load(batch["batch_id"]), batch)
             self.assertNotIn("token", json.dumps(batch).lower())
 
+    def test_sha_validation_accepts_only_40_hexadecimal_characters(self):
+        self.assertTrue(_is_sha("0123456789abcdefABCDEF0123456789abcdefAB"))
+        self.assertFalse(_is_sha("g" * 40))
+        self.assertFalse(_is_sha("a" * 39))
+        self.assertFalse(_is_sha("a" * 41))
+
 
 class PreflightTests(unittest.TestCase):
     def test_preflight_records_exact_remote_shas_for_every_app(self):
@@ -586,7 +856,7 @@ class PreflightTests(unittest.TestCase):
 
         self.assertEqual(batch["state"], "preflight-complete")
         self.assertEqual(batch["apps"]["pocket-manage"]["dev_sha"], "d" * 40)
-        self.assertEqual(batch["apps"]["pocket-manage"]["packages_sha"], "p" * 40)
+        self.assertEqual(batch["apps"]["pocket-manage"]["packages_sha"], "f" * 40)
         self.assertTrue(all(app["state"] == "preflight-complete" for app in batch["apps"].values()))
         self.assertFalse(any(call.mutates for call in operator.runner.calls))
         self.assertIn(
@@ -795,7 +1065,7 @@ class PrepareTests(unittest.TestCase):
             release_object_requires_fetch=True,
         )
         self.addCleanup(operator._test_temporary_directory.cleanup)
-        batch["apps"]["pocket-manage"]["release_sha"] = "o" * 40
+        batch["apps"]["pocket-manage"]["release_sha"] = "3" * 40
         operator.store.save(batch)
 
         result = operator.prepare(batch["batch_id"])
@@ -965,7 +1235,7 @@ class PrepareTests(unittest.TestCase):
             snapshot["apps"]["pocket-manage"] for snapshot in operator.store.snapshots
         ]
         self.assertTrue(any(app.get("dev_push") == "pushed" for app in app_snapshots))
-        self.assertTrue(any(app.get("dev_sha") == "n" * 40 for app in app_snapshots))
+        self.assertTrue(any(app.get("dev_sha") == "1" * 40 for app in app_snapshots))
         self.assertTrue(
             any((app.get("preparation_pr") or {}).get("status") == "open" for app in app_snapshots)
         )
@@ -984,16 +1254,16 @@ class PrepareTests(unittest.TestCase):
             {
                 "worktree": None,
                 "submodule_before": "c" * 40,
-                "submodule_after": "p" * 40,
+                "submodule_after": "f" * 40,
                 "dev_push": "pushed",
                 "preparation_pr": None,
-                "dev_sha": "n" * 40,
+                "dev_sha": "1" * 40,
                 "status": "failed",
                 "error": "interrupted after push",
             }
         )
         batch["state"] = "prepare-failed"
-        operator.runner.remote_dev = "n" * 40
+        operator.runner.remote_dev = "1" * 40
         operator.store.save(batch)
 
         result = operator.prepare(batch["batch_id"])
@@ -1048,7 +1318,7 @@ class DiscoveryTests(unittest.TestCase):
                         {"name": "release-please", "conclusion": "SUCCESS"}
                     ],
                     "head_sha": "a" * 40,
-                    "submodule_sha": "p" * 40,
+                    "submodule_sha": "f" * 40,
                     "result": "ready for approval",
                 }
             ],
@@ -1098,3 +1368,264 @@ class DiscoveryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ReleaseError, "duplicate Release Please"):
             operator.discover_versions(batch)
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_changed_release_pr_head_invalidates_batch_approval(self):
+        operator, batch = awaiting_approval_operator(current_head="b" * 40)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["state"], "awaiting-approval")
+        self.assertEqual(saved["apps"]["pocket-manage"]["release_pr_head_sha"], "b" * 40)
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_changed_release_version_invalidates_batch_approval(self):
+        operator, batch = awaiting_approval_operator(changed_version=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["apps"]["pocket-manage"]["version"], "2.7.1")
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_missing_release_label_invalidates_batch_approval(self):
+        operator, batch = awaiting_approval_operator(missing_label=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        self.assertEqual(operator.store.load(batch["batch_id"])["state"], "awaiting-approval")
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_changed_release_base_invalidates_batch_approval(self):
+        operator, batch = awaiting_approval_operator(changed_base=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        self.assertEqual(operator.store.load(batch["batch_id"])["state"], "awaiting-approval")
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_failed_release_checks_invalidate_batch_approval(self):
+        operator, batch = awaiting_approval_operator(failed_checks=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        saved_checks = operator.store.load(batch["batch_id"])["apps"]["pocket-manage"][
+            "release_pr_checks"
+        ]
+        self.assertEqual(saved_checks[0]["conclusion"], "FAILURE")
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_changed_repository_invalidates_batch_approval(self):
+        operator, batch = awaiting_approval_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        batch["apps"]["pocket-manage"]["repository"] = "MarketplaceSoftware/other"
+        operator.store.save(batch)
+
+        with self.assertRaisesRegex(ReleaseError, "approval snapshot changed"):
+            operator.release(batch["batch_id"])
+
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_release_revalidates_every_app_before_first_merge(self):
+        operator, batch = awaiting_approval_operator(
+            app_keys=["pocket-manage", "installers"]
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.release(batch["batch_id"])
+
+        first_mutation = next(
+            index for index, call in enumerate(operator.runner.calls) if call.mutates
+        )
+        repositories_read = {
+            call.args[call.args.index("--repo") + 1]
+            for call in operator.runner.calls[:first_mutation]
+            if call.args[:3] == ("gh", "pr", "view")
+        }
+        self.assertEqual(
+            repositories_read,
+            {
+                "MarketplaceSoftware/pocketmanage",
+                "MarketplaceSoftware/pocketmanage_installers",
+            },
+        )
+
+    def test_partial_release_records_each_success_before_stopping(self):
+        operator, batch = awaiting_approval_operator(
+            app_keys=["pocket-manage", "installers"], second_merge_fails=True
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "partial release"):
+            operator.release(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["state"], "partial-release")
+        self.assertEqual(saved["apps"]["pocket-manage"]["release_merge"], "merged")
+        self.assertEqual(saved["apps"]["installers"]["release_merge"], "failed")
+        merged_snapshot = next(
+            snapshot
+            for snapshot in operator.store.snapshots
+            if snapshot["apps"]["pocket-manage"].get("release_merge") == "merged"
+        )
+        self.assertNotEqual(merged_snapshot["state"], "partial-release")
+
+    def test_failed_first_merge_sets_release_failed(self):
+        operator, batch = awaiting_approval_operator(
+            app_keys=["installers"], second_merge_fails=True
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "release failed"):
+            operator.release(batch["batch_id"])
+
+        self.assertEqual(operator.store.load(batch["batch_id"])["state"], "release-failed")
+
+    def test_release_resumes_after_confirming_one_successful_merge(self):
+        operator, batch = awaiting_approval_operator(
+            app_keys=["pocket-manage", "installers"], resumed_merge=True
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        merges = [call for call in operator.runner.calls if call.args[:3] == ("gh", "pr", "merge")]
+        confirmed = [
+            call
+            for call in operator.runner.calls
+            if call.args[:4] == ("gh", "pr", "view", "42")
+        ]
+        self.assertTrue(confirmed)
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(merges[0].args[3], "43")
+        self.assertEqual(result["state"], "released")
+
+    def test_release_resumes_a_successful_merge_whose_confirmation_was_interrupted(self):
+        operator, batch = awaiting_approval_operator(merge_confirmation_fails=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "partial release"):
+            operator.release(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["state"], "partial-release")
+        self.assertEqual(saved["apps"]["pocket-manage"]["release_merge"], "merge-unverified")
+
+        operator.runner.merge_confirmation_fails = False
+        result = operator.release(batch["batch_id"])
+        merges = [call for call in operator.runner.calls if call.args[:3] == ("gh", "pr", "merge")]
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(result["state"], "released")
+
+    def test_release_accepts_a_lightweight_tag_on_the_merge_commit(self):
+        operator, batch = awaiting_approval_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        app = result["apps"]["pocket-manage"]
+        self.assertEqual(app["tag_commit_sha"], app["release_merge_sha"])
+        self.assertEqual(result["state"], "released")
+
+    def test_release_dereferences_an_annotated_tag(self):
+        operator, batch = awaiting_approval_operator(annotated_tag=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        self.assertEqual(result["apps"]["pocket-manage"]["tag_commit_sha"], "4" * 40)
+        self.assertTrue(
+            any("/git/tags/" in call.args[2] for call in operator.runner.calls if call.args[:2] == ("gh", "api"))
+        )
+
+    def test_release_rejects_a_tag_on_the_wrong_commit(self):
+        operator, batch = awaiting_approval_operator(wrong_tag=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "tag does not match release merge"):
+            operator.release(batch["batch_id"])
+
+        self.assertEqual(operator.store.load(batch["batch_id"])["state"], "release-failed")
+
+    def test_release_rejects_a_missing_github_release(self):
+        operator, batch = awaiting_approval_operator(missing_release=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "GitHub release"):
+            operator.release(batch["batch_id"])
+
+        self.assertEqual(operator.store.load(batch["batch_id"])["state"], "release-failed")
+
+    def test_release_reports_all_codemagic_links(self):
+        operator, batch = awaiting_approval_operator(codemagic_checks="queued")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        checks = result["apps"]["pocket-manage"]["codemagic_checks"]
+        self.assertEqual(set(checks), set(operator.inventory.codemagic_checks))
+        self.assertTrue(
+            all(item["details_url"].startswith("https://codemagic.io/") for item in checks.values())
+        )
+
+    def test_release_stops_polling_when_all_exact_checks_appear(self):
+        operator, batch = awaiting_approval_operator(codemagic_checks="mixed")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        checks = result["apps"]["pocket-manage"]["codemagic_checks"]
+        self.assertEqual(checks[operator.inventory.codemagic_checks[0]]["conclusion"], "failure")
+        check_calls = [
+            call for call in operator.runner.calls if call.args[:2] == ("gh", "api") and "/check-runs" in call.args[2]
+        ]
+        self.assertEqual(len(check_calls), 1)
+
+    def test_codemagic_timeout_preserves_release_links(self):
+        operator, batch = awaiting_approval_operator(codemagic_checks="timeout")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        app = result["apps"]["pocket-manage"]
+        self.assertEqual(result["state"], "released-builds-unverified")
+        self.assertEqual(app["build_verification"], "unverified")
+        self.assertIn("/releases/tag/v2.7.0", app["tag_url"])
+        self.assertIn("/commit/", app["commit_url"])
+        self.assertEqual(operator.clock.sleeps, [2, 2])
+
+    def test_release_preserves_skipped_apps_without_remote_calls(self):
+        operator, batch = awaiting_approval_operator(
+            app_keys=["partner"], skipped_apps=["partner"]
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        self.assertEqual(result["state"], "released")
+        self.assertEqual(result["apps"]["partner"]["skip_reason"], "no releasable changes")
+        self.assertEqual(operator.runner.calls, [])
+
+    def test_status_is_idempotent_and_read_only(self):
+        operator, batch = awaiting_approval_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        snapshot_count = len(operator.store.snapshots)
+
+        first = operator.status(batch["batch_id"])
+        second = operator.status(batch["batch_id"])
+
+        self.assertEqual(first, second)
+        self.assertEqual(operator.runner.calls, [])
+        self.assertEqual(len(operator.store.snapshots), snapshot_count)
