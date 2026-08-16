@@ -246,8 +246,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     except ReleaseError as error:
-        saved = None
-        if recovery_batch:
+        saved = error.recovery_batch
+        if saved is None and recovery_batch:
             try:
                 saved = operator.status(recovery_batch)
             except (OSError, ValueError, ReleaseError):

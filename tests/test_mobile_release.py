@@ -222,6 +222,34 @@ class CliTests(unittest.TestCase):
         document = json.loads(stdout.getvalue())
         self.assertEqual(document["planned_release_merges"], batch["planned_release_merges"])
 
+    def test_release_dry_run_reports_the_refreshed_head_without_saving_it(self):
+        operator, batch = awaiting_approval_operator(current_head="b" * 40)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        snapshot_count = len(operator.store.snapshots)
+        stdout = io.StringIO()
+
+        with mock.patch.object(mobile_release, "build_operator", return_value=operator):
+            with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", io.StringIO()):
+                result = mobile_release.main(
+                    ["release", "--batch", batch["batch_id"], "--dry-run", "--json"]
+                )
+
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(document["recovery"]["state"], "awaiting-approval")
+        self.assertEqual(
+            document["recovery"]["apps"]["pocket-manage"]["release_pr_head_sha"],
+            "b" * 40,
+        )
+        self.assertEqual(
+            operator.store.load(batch["batch_id"])["apps"]["pocket-manage"][
+                "release_pr_head_sha"
+            ],
+            "a" * 40,
+        )
+        self.assertEqual(len(operator.store.snapshots), snapshot_count)
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
     def test_status_rechecks_unverified_builds_without_remote_mutation(self):
         operator, batch = awaiting_approval_operator(codemagic_checks="timeout")
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1322,6 +1350,35 @@ class PreflightTests(unittest.TestCase):
 
 
 class PrepareTests(unittest.TestCase):
+    def test_prepare_dry_run_and_execution_use_the_same_guarded_merge_command(self):
+        dry_operator, dry_batch = prepared_operator(
+            existing_pr=True,
+            submodule_changed=False,
+        )
+        live_operator, live_batch = prepared_operator(
+            existing_pr=True,
+            submodule_changed=False,
+        )
+        self.addCleanup(dry_operator._test_temporary_directory.cleanup)
+        self.addCleanup(live_operator._test_temporary_directory.cleanup)
+
+        preview = dry_operator.prepare(dry_batch["batch_id"], dry_run=True)
+        live_operator.prepare(live_batch["batch_id"])
+
+        planned = next(
+            command
+            for command in preview["apps"]["pocket-manage"]["planned_commands"]
+            if command[:3] == ["gh", "pr", "merge"]
+        )
+        executed = list(
+            next(
+                call.args
+                for call in live_operator.runner.calls
+                if call.args[:3] == ("gh", "pr", "merge")
+            )
+        )
+        self.assertEqual(planned, executed)
+
     def test_prepare_stops_when_dev_changes_at_the_atomic_merge_guard(self):
         operator, batch = prepared_operator(
             existing_pr=True,
@@ -1706,6 +1763,25 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_dry_run_and_execution_use_the_same_guarded_merge_command(self):
+        dry_operator, dry_batch = awaiting_approval_operator()
+        live_operator, live_batch = awaiting_approval_operator()
+        self.addCleanup(dry_operator._test_temporary_directory.cleanup)
+        self.addCleanup(live_operator._test_temporary_directory.cleanup)
+
+        preview = dry_operator.release(dry_batch["batch_id"], dry_run=True)
+        live_operator.release(live_batch["batch_id"])
+
+        planned = preview["planned_release_merges"][0]["command"]
+        executed = list(
+            next(
+                call.args
+                for call in live_operator.runner.calls
+                if call.args[:3] == ("gh", "pr", "merge")
+            )
+        )
+        self.assertEqual(planned, executed)
+
     def test_release_dry_run_revalidates_and_reports_the_exact_merge(self):
         operator, batch = awaiting_approval_operator()
         self.addCleanup(operator._test_temporary_directory.cleanup)

@@ -25,6 +25,15 @@ PACKAGES_REPOSITORY = "MarketplaceSoftware/packages"
 class ReleaseError(RuntimeError):
     """Report a release guard failure without exposing process credentials."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        recovery_batch: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.recovery_batch = recovery_batch
+
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -394,7 +403,8 @@ class ReleaseOperator:
             if not dry_run:
                 self.store.save(batch)
             raise ReleaseError(
-                f"batch {batch_id}: approval snapshot changed; review and approve again"
+                f"batch {batch_id}: approval snapshot changed; review and approve again",
+                recovery_batch=batch,
             )
 
         if dry_run:
@@ -403,17 +413,11 @@ class ReleaseOperator:
                     "repository": app.repository,
                     "pull_request_number": app_record["release_pr_number"],
                     "head_sha": app_record["release_pr_head_sha"],
-                    "command": [
-                        "gh",
-                        "pr",
-                        "merge",
-                        str(app_record["release_pr_number"]),
-                        "--repo",
+                    "command": _guarded_merge_command(
                         app.repository,
-                        "--merge",
-                        "--match-head-commit",
+                        str(app_record["release_pr_number"]),
                         app_record["release_pr_head_sha"],
-                    ],
+                    ),
                 }
                 for app, app_record in unfinished
             ]
@@ -421,17 +425,11 @@ class ReleaseOperator:
 
         for app, app_record in unfinished:
             number = str(app_record["release_pr_number"])
-            merge_command = [
-                "gh",
-                "pr",
-                "merge",
-                number,
-                "--repo",
+            merge_command = _guarded_merge_command(
                 app.repository,
-                "--merge",
-                "--match-head-commit",
+                number,
                 app_record["release_pr_head_sha"],
-            ]
+            )
             merge_result = self.runner.run(merge_command, mutates=True)
             if merge_result.returncode != 0:
                 self._record_release_failure(
@@ -1261,17 +1259,11 @@ class ReleaseOperator:
             app_record["planned_commands"].append(create)
             number = "<preparation-pr-number>"
             app_record["planned_commands"].append(
-                [
-                    "gh",
-                    "pr",
-                    "merge",
-                    number,
-                    "--repo",
+                _guarded_merge_command(
                     app.repository,
-                    "--merge",
-                    "--match-head-commit",
+                    number,
                     dev_sha,
-                ]
+                )
             )
             app_record["status"] = "planned"
             return
@@ -1390,33 +1382,21 @@ class ReleaseOperator:
 
         if dry_run:
             app_record["planned_commands"].append(
-                [
-                    "gh",
-                    "pr",
-                    "merge",
-                    number,
-                    "--repo",
+                _guarded_merge_command(
                     app.repository,
-                    "--merge",
-                    "--match-head-commit",
+                    number,
                     dev_sha,
-                ]
+                )
             )
             app_record["status"] = "planned"
             return
 
         self._run(
-            [
-                "gh",
-                "pr",
-                "merge",
-                number,
-                "--repo",
+            _guarded_merge_command(
                 app.repository,
-                "--merge",
-                "--match-head-commit",
+                number,
                 dev_sha,
-            ],
+            ),
             repository=app.repository,
             mutates=True,
         )
@@ -1861,6 +1841,24 @@ def _release_checks_pass(checks: Any) -> bool:
 
 def _remote_tracking_refspec(branch: str) -> str:
     return f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+
+
+def _guarded_merge_command(
+    repository: str,
+    pull_request_number: str,
+    head_sha: str,
+) -> list[str]:
+    return [
+        "gh",
+        "pr",
+        "merge",
+        pull_request_number,
+        "--repo",
+        repository,
+        "--merge",
+        "--match-head-commit",
+        head_sha,
+    ]
 
 
 def _codemagic_workflow_names(content: str) -> set[str]:
