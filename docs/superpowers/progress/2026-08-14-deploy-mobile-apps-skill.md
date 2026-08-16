@@ -1,42 +1,36 @@
-# Deploy mobile apps skill checkpoint
+# Deploy mobile apps skill completion record
 
-## Stopped state
+## Final state
 
-Work stopped at the user's request on branch `feat/deploy-mobile-apps`, after commit `473ac4b966707aa2eef40ab03115c9f97e2cdf77`.
+Work resumed from the checkpoint on branch `feat/deploy-mobile-apps`. Tasks 1 through 8 are implemented, reviewed, and verified.
 
-Tasks 1 through 7 are implemented and reviewed. Task 8 reached final branch verification but did not push or open a pull request because its review found five material safety gaps. The final fix agent was interrupted before it changed any file. The worktree was clean at this checkpoint.
+No live mobile release ran. Verification did not mutate any managed mobile repository, GitHub release state, or saved batch state.
 
-No live mobile release ran. No mobile repository or GitHub release state was mutated by verification.
+## Safety fixes completed
 
-## Verification at checkpoint
+Commit `a8a35934b47ea0eb1d7ea1f7e7c84b7cc8f67143` closed the five safety gaps found during the original Task 8 review:
 
-- `python -m unittest discover -s tests -v`: 71 tests passed.
+1. Preflight verifies effective repository write and merge permissions for every managed app.
+2. Preflight rejects conflicting deployment worktrees.
+3. `release --dry-run` revalidates approval and reports the exact guarded merges it would execute.
+4. The automatic `dev` to `release` merge uses the approved head as an atomic precondition.
+5. A CodeMagic detection timeout retains every check already observed while identifying missing checks.
+
+The scoped review found two follow-up issues. Commit `be8a4b706a3032cd4adc94be0cca143242a05fc6` fixed both:
+
+- stale approval recovery now prints the refreshed dry-run snapshot without changing saved state;
+- one helper builds every guarded merge command used by previews and execution.
+
+Parallel Standards and Spec re-reviews approved the follow-up diff with no findings.
+
+## Final verification
+
+- `python -m unittest discover -s tests -v`: 79 tests passed.
 - Skill Creator `quick_validate.py`: passed.
 - Python compilation: passed.
-- Three-repository `preflight --dry-run --json`: passed and left repository and batch-state snapshots unchanged.
+- Three-repository `preflight --dry-run --json`: passed, detected all three apps, and left the feature worktree unchanged.
 - `git diff --check main...HEAD`: passed.
 
-## Open safety work
+## Handoff point
 
-1. Preflight must verify effective repository write and merge permissions for every managed app.
-2. Preflight must reject conflicting deployment worktrees.
-3. `release --dry-run` must perform approval revalidation and report the exact version PR merges it would execute.
-4. The automatic `dev` to `release` merge must use an exact approved-head precondition so a concurrent `dev` push cannot enter the release.
-5. A CodeMagic detection timeout must retain checks already observed, including status, conclusion, and build URL, while identifying missing checks.
-
-## Resume point
-
-Resume in the existing feature worktree:
-
-```bash
-cd /Users/nortus/Developer/misc/.claude/worktrees/agent-skills-deploy-mobile-apps
-```
-
-Read these files first:
-
-- `docs/superpowers/specs/2026-08-14-deploy-mobile-apps-skill-design.md`
-- `docs/superpowers/plans/2026-08-14-deploy-mobile-apps-skill.md`
-- `.superpowers/sdd/2026-08-14-deploy-mobile-apps-skill/progress.md`
-- `.superpowers/sdd/2026-08-14-deploy-mobile-apps-skill/task-8-report.md`
-
-Implement the five open findings with failing tests, run one scoped review of that fix wave, rerun Task 8 verification, then push the branch and open the PR against `main`. Do not merge the PR.
+The implementation is complete on `feat/deploy-mobile-apps`. Publish the branch and open its pull request against `main`; do not merge the pull request.
