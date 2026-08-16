@@ -197,18 +197,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         operator.status.assert_not_called()
 
-    def test_release_dry_run_only_reloads_saved_status(self):
+    def test_release_dry_run_calls_release_revalidation_and_prints_merge_plan(self):
         with mock.patch.object(mobile_release, "build_operator") as factory:
             operator = factory.return_value
-            operator.status.return_value = self._batch()
-            with mock.patch("sys.stdout", io.StringIO()):
+            batch = self._batch()
+            batch["planned_release_merges"] = [
+                {
+                    "repository": "MarketplaceSoftware/pocketmanage",
+                    "pull_request_number": 42,
+                    "head_sha": "a" * 40,
+                    "command": ["gh", "pr", "merge", "42"],
+                }
+            ]
+            operator.release.return_value = batch
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
                 result = mobile_release.main(
                     ["release", "--batch", "batch-1", "--dry-run", "--json"]
                 )
 
         self.assertEqual(result, 0)
-        operator.status.assert_called_once_with("batch-1")
-        operator.release.assert_not_called()
+        operator.release.assert_called_once_with("batch-1", dry_run=True)
+        operator.status.assert_not_called()
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["planned_release_merges"], batch["planned_release_merges"])
 
     def test_status_rechecks_unverified_builds_without_remote_mutation(self):
         operator, batch = awaiting_approval_operator(codemagic_checks="timeout")
@@ -283,6 +295,7 @@ class PreparationRunner:
         merge_conflict=False,
         dirty_worktree=False,
         push_rejected=False,
+        promotion_head_race=False,
         remote_dev=None,
         remote_release=None,
         resumed=False,
@@ -300,6 +313,7 @@ class PreparationRunner:
         self.merge_conflict = merge_conflict
         self.dirty_worktree = dirty_worktree
         self.push_rejected = push_rejected
+        self.promotion_head_race = promotion_head_race
         self.remote_dev = remote_dev or "d" * 40
         self.remote_release = remote_release or "e" * 40
         self.resumed = resumed
@@ -400,6 +414,7 @@ class PreparationRunner:
                         "number": 17,
                         "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/17",
                         "headRefName": "dev",
+                        "headRefOid": self.remote_dev,
                         "baseRefName": "release",
                     }
                 )
@@ -409,6 +424,7 @@ class PreparationRunner:
                         "number": 18,
                         "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/18",
                         "headRefName": "dev",
+                        "headRefOid": self.remote_dev,
                         "baseRefName": "release",
                     }
                 )
@@ -469,12 +485,15 @@ class PreparationRunner:
                         "mergeable": mergeable,
                         "mergeStateStatus": "DIRTY" if self.merge_conflict else "CLEAN",
                         "headRefName": "dev",
+                        "headRefOid": self.remote_dev,
                         "baseRefName": "release",
                     }
                 ),
                 "",
             )
         if command[:3] == ("gh", "pr", "merge"):
+            if self.promotion_head_race and "--match-head-commit" in command:
+                return CommandResult(1, "", "head branch was modified")
             self.remote_release = "2" * 40
             return CommandResult(0, "", "")
         if command[:2] == ("gh", "api"):
@@ -741,7 +760,10 @@ class ReleaseRunner:
                 names = load_inventory(
                     SKILL_ROOT / "references/apps.json"
                 ).codemagic_checks
-                for index, name in enumerate(names):
+                returned_names = (
+                    names[:1] if self.codemagic_checks == "partial-timeout" else names
+                )
+                for index, name in enumerate(returned_names):
                     status = "completed" if self.codemagic_checks == "mixed" and index == 0 else "queued"
                     check_runs.append(
                         {
@@ -923,6 +945,7 @@ def prepared_operator(
     merge_conflict=False,
     dirty_worktree=False,
     push_rejected=False,
+    promotion_head_race=False,
     resumed=False,
 ):
     temporary = tempfile.TemporaryDirectory()
@@ -948,6 +971,7 @@ def prepared_operator(
         merge_conflict=merge_conflict,
         dirty_worktree=dirty_worktree,
         push_rejected=push_rejected,
+        promotion_head_race=promotion_head_race,
         remote_dev=remote_dev,
         remote_release=remote_release,
         resumed=resumed,
@@ -977,6 +1001,7 @@ def prepared_operator(
         batch["state"] = "prepare-failed"
         batch["apps"][app_key].update(
             {
+                "dev_sha": remote_dev,
                 "worktree": None,
                 "submodule_before": "c" * 40,
                 "submodule_after": "f" * 40,
@@ -1002,6 +1027,11 @@ def successful_preflight_responses(app_count=3):
         "MarketplaceSoftware/pocketmanage_partner",
     )
     responses.extend(CommandResult(0, f"git@github.com:{repository}.git\n", "") for repository in repositories)
+    responses.extend(
+        CommandResult(0, json.dumps({"viewerPermission": "WRITE"}), "")
+        for _ in range(app_count)
+    )
+    responses.extend(CommandResult(0, "", "") for _ in range(app_count))
     for _ in range(app_count):
         responses.extend(
             [
@@ -1089,6 +1119,52 @@ class InventoryTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_preflight_rejects_a_repository_without_write_permission(self):
+        responses = successful_preflight_responses()
+        responses[5] = CommandResult(
+            0,
+            json.dumps({"viewerPermission": "READ"}),
+            "",
+        )
+        operator = make_operator(responses)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(
+            ReleaseError,
+            "MarketplaceSoftware/pocketmanage_installers.*write or merge permission",
+        ):
+            operator.preflight(["pocket-manage", "installers", "partner"])
+
+        self.assertFalse(
+            any(call.args[:2] == ("git", "fetch") for call in operator.runner.calls)
+        )
+
+    def test_preflight_rejects_an_active_deployment_worktree(self):
+        responses = successful_preflight_responses(app_count=1)
+        responses.insert(
+            5,
+            CommandResult(
+                0,
+                "\n".join(
+                    [
+                        "worktree /tmp/pocketmanage/.claude/worktrees/old-batch-pocket-manage",
+                        f"HEAD {'1' * 40}",
+                        "branch refs/heads/deploy-mobile-apps/old-batch/pocket-manage",
+                        "",
+                    ]
+                ),
+                "",
+            ),
+        )
+        operator = make_operator(responses)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(
+            ReleaseError,
+            "MarketplaceSoftware/pocketmanage.*conflicting deployment worktree.*old-batch-pocket-manage",
+        ):
+            operator.preflight(["pocket-manage"])
+
     def test_preflight_records_exact_remote_shas_for_every_app(self):
         operator = make_operator(successful_preflight_responses())
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1165,7 +1241,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_mismatched_packages_origin(self):
         responses = successful_preflight_responses(app_count=1)
-        responses[7] = CommandResult(
+        responses[9] = CommandResult(
             0,
             "git@github.com:MarketplaceSoftware/not-packages.git\n",
             "",
@@ -1246,6 +1322,20 @@ class PreflightTests(unittest.TestCase):
 
 
 class PrepareTests(unittest.TestCase):
+    def test_prepare_stops_when_dev_changes_at_the_atomic_merge_guard(self):
+        operator, batch = prepared_operator(
+            existing_pr=True,
+            promotion_head_race=True,
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "head branch was modified"):
+            operator.prepare(batch["batch_id"])
+
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["state"], "prepare-failed")
+        self.assertEqual(operator.runner.remote_release, "e" * 40)
+
     def test_prepare_discovers_versions_after_successful_non_dry_run(self):
         operator, batch = prepared_operator(existing_pr=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1616,6 +1706,50 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_dry_run_revalidates_and_reports_the_exact_merge(self):
+        operator, batch = awaiting_approval_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        snapshot_count = len(operator.store.snapshots)
+
+        result = operator.release(batch["batch_id"], dry_run=True)
+
+        self.assertEqual(
+            result["planned_release_merges"],
+            [
+                {
+                    "repository": "MarketplaceSoftware/pocketmanage",
+                    "pull_request_number": 42,
+                    "head_sha": "a" * 40,
+                    "command": [
+                        "gh",
+                        "pr",
+                        "merge",
+                        "42",
+                        "--repo",
+                        "MarketplaceSoftware/pocketmanage",
+                        "--merge",
+                        "--match-head-commit",
+                        "a" * 40,
+                    ],
+                }
+            ],
+        )
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+        self.assertTrue(
+            any(call.args[:3] == ("gh", "pr", "view") for call in operator.runner.calls)
+        )
+        self.assertTrue(
+            any(
+                call.args[:2] == ("gh", "api") and "/contents/" in call.args[2]
+                for call in operator.runner.calls
+            )
+        )
+        self.assertEqual(len(operator.store.snapshots), snapshot_count)
+        self.assertNotIn(
+            "planned_release_merges",
+            operator.store.load(batch["batch_id"]),
+        )
+
     def test_changed_release_pr_head_invalidates_batch_approval(self):
         operator, batch = awaiting_approval_operator(current_head="b" * 40)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1902,6 +2036,33 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("/releases/tag/v2.7.0", app["tag_url"])
         self.assertIn("/commit/", app["commit_url"])
         self.assertEqual(operator.clock.sleeps, [2, 2])
+
+    def test_codemagic_timeout_retains_observed_checks_and_names_missing_checks(self):
+        operator, batch = awaiting_approval_operator(
+            codemagic_checks="partial-timeout"
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        app = result["apps"]["pocket-manage"]
+        observed_name = operator.inventory.codemagic_checks[0]
+        self.assertEqual(
+            app["codemagic_checks"],
+            {
+                observed_name: {
+                    "status": "queued",
+                    "conclusion": None,
+                    "details_url": "https://codemagic.io/app/check-0",
+                }
+            },
+        )
+        self.assertEqual(
+            app["codemagic_missing_checks"],
+            list(operator.inventory.codemagic_checks[1:]),
+        )
+        self.assertEqual(app["build_verification"], "unverified")
+        self.assertEqual(result["state"], "released-builds-unverified")
 
     def test_release_preserves_skipped_apps_without_remote_calls(self):
         operator, batch = awaiting_approval_operator(

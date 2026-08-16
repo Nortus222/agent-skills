@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Sequence, TextIO
@@ -173,6 +174,15 @@ def _print_human(
             f"result={row.get('result') or '-'}",
         ]
         print("  " + " | ".join(fields), file=stream)
+    if document.get("planned_release_merges"):
+        print("Planned Release Please merges:", file=stream)
+        for plan in document["planned_release_merges"]:
+            print(
+                "  "
+                + f"{plan['repository']} PR #{plan['pull_request_number']} "
+                + f"at {plan['head_sha']}: {shlex.join(plan['command'])}",
+                file=stream,
+            )
     print("Warnings:", file=stream)
     if document["warnings"]:
         for warning in document["warnings"]:
@@ -220,11 +230,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 next_command_override = f"{COMMAND_PREFIX} preflight --json"
         elif args.command == "prepare":
             batch = operator.prepare(args.batch, dry_run=args.dry_run)
-        elif args.command == "release" and args.dry_run:
-            warnings.append("dry run: approval was not consumed and no release merge ran")
-            batch = operator.status(args.batch)
         elif args.command == "release":
-            batch = operator.release(args.batch)
+            if args.dry_run:
+                warnings.append(
+                    "dry run: approval was revalidated and no release merge ran"
+                )
+            batch = operator.release(args.batch, dry_run=args.dry_run)
         else:
             batch = _observe_status(operator, args.batch)
         _print_result(

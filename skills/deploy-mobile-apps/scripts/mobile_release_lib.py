@@ -196,6 +196,12 @@ class ReleaseOperator:
 
         workspace_root = self._workspace_root()
         repositories = self._discover_repositories(workspace_root, selected_apps)
+        for app_key in selected_apps:
+            self._verify_repository_permission(self.inventory.apps[app_key])
+        for app_key in selected_apps:
+            self._reject_conflicting_deployment_worktrees(
+                self.inventory.apps[app_key], repositories[app_key]
+            )
         batch = new_batch(selected_apps)
 
         for app_key in selected_apps:
@@ -317,7 +323,7 @@ class ReleaseOperator:
         self.store.save(batch)
         return batch
 
-    def release(self, batch_id: str) -> dict[str, Any]:
+    def release(self, batch_id: str, dry_run: bool = False) -> dict[str, Any]:
         """Merge an unchanged approval snapshot and verify release build startup."""
         batch = self.store.load(batch_id)
         allowed_states = {
@@ -359,7 +365,8 @@ class ReleaseOperator:
                             "result": "Release Please pull request merged",
                         }
                     )
-                    self.store.save(batch)
+                    if not dry_run:
+                        self.store.save(batch)
                 continue
 
             snapshot = self._current_release_snapshot(app, app_record)
@@ -374,7 +381,8 @@ class ReleaseOperator:
                         "result": "Release Please pull request merged",
                     }
                 )
-                self.store.save(batch)
+                if not dry_run:
+                    self.store.save(batch)
                 continue
             if not self._approval_snapshot_matches(app, app_record, snapshot):
                 self._replace_approval_snapshot(app_record, snapshot)
@@ -383,10 +391,33 @@ class ReleaseOperator:
 
         if approval_changed:
             batch["state"] = "awaiting-approval"
-            self.store.save(batch)
+            if not dry_run:
+                self.store.save(batch)
             raise ReleaseError(
                 f"batch {batch_id}: approval snapshot changed; review and approve again"
             )
+
+        if dry_run:
+            batch["planned_release_merges"] = [
+                {
+                    "repository": app.repository,
+                    "pull_request_number": app_record["release_pr_number"],
+                    "head_sha": app_record["release_pr_head_sha"],
+                    "command": [
+                        "gh",
+                        "pr",
+                        "merge",
+                        str(app_record["release_pr_number"]),
+                        "--repo",
+                        app.repository,
+                        "--merge",
+                        "--match-head-commit",
+                        app_record["release_pr_head_sha"],
+                    ],
+                }
+                for app, app_record in unfinished
+            ]
+            return batch
 
         for app, app_record in unfinished:
             number = str(app_record["release_pr_number"])
@@ -692,12 +723,13 @@ class ReleaseOperator:
             }
         )
         self.store.save(batch)
-        checks = self._wait_for_codemagic_checks(app, tag_commit_sha)
-        if checks is None:
+        checks, missing_checks = self._wait_for_codemagic_checks(app, tag_commit_sha)
+        if missing_checks:
             app_record.update(
                 {
                     "build_verification": "unverified",
-                    "codemagic_checks": {},
+                    "codemagic_checks": checks,
+                    "codemagic_missing_checks": missing_checks,
                     "state": "released-builds-unverified",
                     "status": "released",
                     "result": "released; CodeMagic build startup unverified",
@@ -709,6 +741,7 @@ class ReleaseOperator:
             {
                 "build_verification": "verified",
                 "codemagic_checks": checks,
+                "codemagic_missing_checks": [],
                 "state": "released",
                 "status": "released",
                 "error": None,
@@ -761,7 +794,7 @@ class ReleaseOperator:
 
     def _wait_for_codemagic_checks(
         self, app: AppConfig, commit_sha: str
-    ) -> dict[str, dict[str, Any]] | None:
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
         deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
         command = [
             "gh",
@@ -769,6 +802,7 @@ class ReleaseOperator:
             f"repos/{app.repository}/commits/{commit_sha}/check-runs",
         ]
         expected = set(self.inventory.codemagic_checks)
+        observed: dict[str, dict[str, Any]] = {}
         while True:
             response = self._load_json(
                 self._run(command, repository=app.repository).stdout,
@@ -812,10 +846,14 @@ class ReleaseOperator:
                     "conclusion": conclusion,
                     "details_url": details_url,
                 }
-            if set(found) == expected:
-                return found
+            observed.update(found)
+            missing = [
+                name for name in self.inventory.codemagic_checks if name not in observed
+            ]
+            if not missing:
+                return observed, []
             if self.clock.monotonic() >= deadline:
-                return None
+                return observed, missing
             self.clock.sleep(self.poll_policy.interval_seconds)
 
     def _command_error(
@@ -1002,7 +1040,7 @@ class ReleaseOperator:
                     "--repo",
                     app.repository,
                     "--json",
-                    "number,url,state,mergedAt,mergeable,mergeStateStatus,headRefName,baseRefName",
+                    "number,url,state,mergedAt,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName",
                 ],
                 repository=app.repository,
             ).stdout,
@@ -1016,6 +1054,7 @@ class ReleaseOperator:
         if (
             pull_request.get("state") != "MERGED"
             or pull_request.get("headRefName") != app.dev_branch
+            or pull_request.get("headRefOid") != app_record.get("dev_sha")
             or pull_request.get("baseRefName") != app.release_branch
         ):
             raise ReleaseError(
@@ -1190,7 +1229,11 @@ class ReleaseOperator:
             raise ReleaseError(
                 f"repository {app.repository}: invalid fetched development or release branch"
             )
-        _, release_sha = branch_shas
+        dev_sha, release_sha = branch_shas
+        if dev_sha != app_record["dev_sha"]:
+            raise ReleaseError(
+                f"repository {app.repository}: origin/dev changed before promotion"
+            )
         ancestry_command = ["git", "merge-base", "--is-ancestor", dev_ref, release_ref]
         ancestry = self.runner.run(ancestry_command, cwd=repository_path, mutates=False)
         if ancestry.returncode not in {0, 1}:
@@ -1218,13 +1261,25 @@ class ReleaseOperator:
             app_record["planned_commands"].append(create)
             number = "<preparation-pr-number>"
             app_record["planned_commands"].append(
-                ["gh", "pr", "merge", number, "--repo", app.repository, "--merge"]
+                [
+                    "gh",
+                    "pr",
+                    "merge",
+                    number,
+                    "--repo",
+                    app.repository,
+                    "--merge",
+                    "--match-head-commit",
+                    dev_sha,
+                ]
             )
             app_record["status"] = "planned"
             return
 
         if pull_requests:
-            pull_request = self._validate_exact_preparation_pr(app, pull_requests[0])
+            pull_request = self._validate_exact_preparation_pr(
+                app, pull_requests[0], dev_sha
+            )
             pull_request["status"] = "open"
         else:
             created = self._run(
@@ -1241,6 +1296,7 @@ class ReleaseOperator:
                 "number": int(match.group(1)),
                 "url": created,
                 "headRefName": app.dev_branch,
+                "headRefOid": dev_sha,
                 "baseRefName": app.release_branch,
                 "status": "open",
             }
@@ -1311,7 +1367,7 @@ class ReleaseOperator:
                     "--repo",
                     app.repository,
                     "--json",
-                    "number,url,state,mergedAt,mergeable,mergeStateStatus,headRefName,baseRefName",
+                    "number,url,state,mergedAt,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName",
                 ],
                 repository=app.repository,
             ).stdout,
@@ -1322,7 +1378,7 @@ class ReleaseOperator:
             raise ReleaseError(
                 f"repository {app.repository}: invalid preparation pull request response"
             )
-        self._validate_exact_preparation_pr(app, pull_request_state)
+        self._validate_exact_preparation_pr(app, pull_request_state, dev_sha)
         if (
             pull_request_state.get("state") != "OPEN"
             or pull_request_state.get("mergeable") != "MERGEABLE"
@@ -1334,13 +1390,33 @@ class ReleaseOperator:
 
         if dry_run:
             app_record["planned_commands"].append(
-                ["gh", "pr", "merge", number, "--repo", app.repository, "--merge"]
+                [
+                    "gh",
+                    "pr",
+                    "merge",
+                    number,
+                    "--repo",
+                    app.repository,
+                    "--merge",
+                    "--match-head-commit",
+                    dev_sha,
+                ]
             )
             app_record["status"] = "planned"
             return
 
         self._run(
-            ["gh", "pr", "merge", number, "--repo", app.repository, "--merge"],
+            [
+                "gh",
+                "pr",
+                "merge",
+                number,
+                "--repo",
+                app.repository,
+                "--merge",
+                "--match-head-commit",
+                dev_sha,
+            ],
             repository=app.repository,
             mutates=True,
         )
@@ -1371,7 +1447,7 @@ class ReleaseOperator:
                     "--head",
                     app.dev_branch,
                     "--json",
-                    "number,url,headRefName,baseRefName",
+                    "number,url,headRefName,headRefOid,baseRefName",
                 ],
                 repository=app.repository,
             ).stdout,
@@ -1404,12 +1480,15 @@ class ReleaseOperator:
 
     @staticmethod
     def _validate_exact_preparation_pr(
-        app: AppConfig, pull_request: dict[str, Any]
+        app: AppConfig,
+        pull_request: dict[str, Any],
+        expected_head_sha: str,
     ) -> dict[str, Any]:
         if (
             not isinstance(pull_request.get("number"), int)
             or not isinstance(pull_request.get("url"), str)
             or pull_request.get("headRefName") != app.dev_branch
+            or pull_request.get("headRefOid") != expected_head_sha
             or pull_request.get("baseRefName") != app.release_branch
         ):
             raise ReleaseError(
@@ -1633,6 +1712,52 @@ class ReleaseOperator:
             "packages_sha": packages_sha,
             "dev_to_release_pr": pull_requests[0] if pull_requests else None,
         }
+
+    def _verify_repository_permission(self, app: AppConfig) -> None:
+        response = self._load_json(
+            self._run(
+                [
+                    "gh",
+                    "repo",
+                    "view",
+                    app.repository,
+                    "--json",
+                    "viewerPermission",
+                ],
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="repository permission response",
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("viewerPermission") not in {"WRITE", "MAINTAIN", "ADMIN"}
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: authenticated user lacks write or merge permission"
+            )
+
+    def _reject_conflicting_deployment_worktrees(
+        self, app: AppConfig, repository_path: Path
+    ) -> None:
+        output = self._run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repository_path,
+            repository=app.repository,
+        ).stdout
+        for record in output.strip().split("\n\n"):
+            fields = dict(
+                line.split(" ", 1)
+                for line in record.splitlines()
+                if " " in line
+            )
+            if fields.get("branch", "").startswith(
+                "refs/heads/deploy-mobile-apps/"
+            ):
+                path = fields.get("worktree", "<unknown>")
+                raise ReleaseError(
+                    f"repository {app.repository}: conflicting deployment worktree {path}"
+                )
 
     def _run(
         self,
