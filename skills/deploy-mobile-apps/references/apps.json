@@ -1,0 +1,22 @@
+{
+  "workspace_root_env": "EMANAGE_MOBILE_ROOT",
+  "default_workspace_root": "~/Developer/emanageOne",
+  "codemagic_checks": [
+    "Build Android AppBundle and Publish",
+    "Build IPA and Publish To AppStore Connect",
+    "Build Web and Publish to Firebase Hosting"
+  ],
+  "apps": {
+    "pocket-manage": {"display_name": "Pocket Manage", "repository": "MarketplaceSoftware/pocketmanage", "directory": "pocketmanage"},
+    "installers": {"display_name": "Pocket Manage Installers", "repository": "MarketplaceSoftware/pocketmanage_installers", "directory": "pocketmanage_installers"},
+    "partner": {"display_name": "Pocket Manage Partner", "repository": "MarketplaceSoftware/pocketmanage_partner", "directory": "pocketmanage_partner"}
+  },
+  "defaults": {
+    "dev_branch": "dev",
+    "release_branch": "release",
+    "submodule_path": "packages",
+    "submodule_branch": "main",
+    "release_label": "autorelease: pending",
+    "release_manifest": ".release-please-manifest.json"
+  }
+}

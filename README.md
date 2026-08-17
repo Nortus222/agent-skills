@@ -20,6 +20,7 @@ npx skills update
 
 | Skill | Use when |
 | --- | --- |
+| [deploy-mobile-apps](skills/deploy-mobile-apps/) | You need to prepare or release the managed Pocket Manage mobile apps with a saved approval boundary. |
 | [explain](skills/explain/) | You want something explained so you genuinely understand it — a file, class, module, subsystem, concept, commit range, branch diff, uncommitted work, or PR. Writes a self-contained HTML document with rendered Mermaid diagrams. |
 
 ## How this fits the rest of the setup
@@ -41,5 +42,6 @@ on every machine, and `skills-check.sh` reports any that have gone missing.
 ## Adding a skill here
 
 One directory per skill under `skills/`, containing a `SKILL.md` with `name` and
-`description` frontmatter. Keep them repo-agnostic — anything that hardcodes one
-project's layout belongs in that project's `.claude/skills/` instead.
+`description` frontmatter. Keep broadly reusable skills repo-agnostic. Personal
+multi-repository operator skills may keep their managed inventory in a bundled
+reference file instead of duplicating it in `SKILL.md`.
