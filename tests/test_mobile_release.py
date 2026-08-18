@@ -321,6 +321,7 @@ class PreparationRunner:
         release_contains_dev=False,
         release_object_requires_fetch=False,
         merge_conflict=False,
+        mergeable_unknown_first=False,
         carried_commits=None,
         dirty_worktree=False,
         push_rejected=False,
@@ -340,6 +341,7 @@ class PreparationRunner:
         self.release_object_requires_fetch = release_object_requires_fetch
         self.promotion_refs_fetched = False
         self.merge_conflict = merge_conflict
+        self.mergeable_unknown_first = mergeable_unknown_first
         self.carried_commits = (
             ["fix: show every delivery group's cartons"]
             if carried_commits is None
@@ -518,6 +520,9 @@ class PreparationRunner:
         if command[:3] == ("gh", "pr", "view"):
             state = "MERGED" if self.resumed else "OPEN"
             mergeable = "CONFLICTING" if self.merge_conflict else "MERGEABLE"
+            if self.mergeable_unknown_first:
+                self.mergeable_unknown_first = False
+                mergeable = "UNKNOWN"
             return CommandResult(
                 0,
                 json.dumps(
@@ -662,6 +667,7 @@ class ReleaseRunner:
         resumed_merge=False,
         merge_confirmation_fails=False,
         no_release_checks=False,
+        tag_missing_first=False,
         release_mergeable="MERGEABLE",
         extra_label=False,
         head_race=False,
@@ -680,6 +686,7 @@ class ReleaseRunner:
         self.codemagic_checks = codemagic_checks
         self.merge_confirmation_fails = merge_confirmation_fails
         self.no_release_checks = no_release_checks
+        self.tag_missing_first = tag_missing_first
         self.release_mergeable = release_mergeable
         self.extra_label = extra_label
         self.head_race = head_race
@@ -767,6 +774,9 @@ class ReleaseRunner:
                 "",
             )
         if command[:2] == ("gh", "api") and "/git/ref/tags/" in command[2]:
+            if self.tag_missing_first:
+                self.tag_missing_first = False
+                return CommandResult(1, "", "gh: Not Found (HTTP 404)")
             merge_sha = self.merge_shas[repository]
             tag_sha = "7" * 40 if self.annotated_tag else merge_sha
             if self.wrong_tag:
@@ -898,6 +908,7 @@ def awaiting_approval_operator(
     resumed_merge=False,
     merge_confirmation_fails=False,
     no_release_checks=False,
+    tag_missing_first=False,
     release_mergeable="MERGEABLE",
     extra_label=False,
     head_race=False,
@@ -922,6 +933,7 @@ def awaiting_approval_operator(
         resumed_merge=resumed_merge,
         merge_confirmation_fails=merge_confirmation_fails,
         no_release_checks=no_release_checks,
+        tag_missing_first=tag_missing_first,
         release_mergeable=release_mergeable,
         extra_label=extra_label,
         head_race=head_race,
@@ -1003,6 +1015,7 @@ def prepared_operator(
     release_contains_dev=False,
     release_object_requires_fetch=False,
     merge_conflict=False,
+    mergeable_unknown_first=False,
     carried_commits=None,
     dirty_worktree=False,
     push_rejected=False,
@@ -1030,6 +1043,7 @@ def prepared_operator(
         release_contains_dev=release_contains_dev,
         release_object_requires_fetch=release_object_requires_fetch,
         merge_conflict=merge_conflict,
+        mergeable_unknown_first=mergeable_unknown_first,
         carried_commits=carried_commits,
         dirty_worktree=dirty_worktree,
         push_rejected=push_rejected,
@@ -1734,6 +1748,21 @@ class PrepareTests(unittest.TestCase):
         self.assertNotIn("BREAKING CHANGE:", message)
         self.assertNotIn("!:", message.splitlines()[0])
 
+    def test_unknown_mergeability_is_waited_for_rather_than_refused(self):
+        operator, batch = prepared_operator(
+            existing_pr=True, mergeable_unknown_first=True
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        operator.clock = FakeClock()
+        operator.poll_policy = PollPolicy(interval_seconds=2, timeout_seconds=10)
+
+        operator.prepare(batch["batch_id"])
+
+        self.assertEqual(operator.clock.sleeps, [2])
+        self.assertTrue(
+            any(call.args[:3] == ("gh", "pr", "merge") for call in operator.runner.calls)
+        )
+
     def test_prepare_deletes_the_deployment_branch_with_its_worktree(self):
         operator, batch = prepared_operator()
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -2195,6 +2224,14 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseError, "checks are not passing"):
             operator.release(batch["batch_id"])
 
+    def test_a_tag_that_has_not_appeared_yet_is_waited_for(self):
+        operator, batch = awaiting_approval_operator(tag_missing_first=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        self.assertEqual(result["apps"]["pocket-manage"]["tag"], "v2.7.0")
+
     def test_head_race_rejection_records_no_successful_merge(self):
         operator, batch = awaiting_approval_operator(head_race=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -2343,7 +2380,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("/commit/", app["commit_url"])
         self.assertEqual(operator.clock.sleeps, [2, 2])
 
-    def test_codemagic_timeout_retains_observed_checks_and_names_missing_checks(self):
+    def test_a_started_build_finishes_the_release_and_names_the_rest(self):
         operator, batch = awaiting_approval_operator(
             codemagic_checks="partial-timeout"
         )
@@ -2367,8 +2404,9 @@ class ReleaseTests(unittest.TestCase):
             app["codemagic_missing_checks"],
             list(operator.inventory.codemagic_checks[1:]),
         )
-        self.assertEqual(app["build_verification"], "unverified")
-        self.assertEqual(result["state"], "released-builds-unverified")
+        self.assertEqual(app["build_verification"], "started")
+        self.assertEqual(result["state"], "released")
+        self.assertIsNone(app["error"])
 
     def test_release_preserves_skipped_apps_without_remote_calls(self):
         operator, batch = awaiting_approval_operator(

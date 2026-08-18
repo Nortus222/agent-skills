@@ -43,9 +43,9 @@ After the user confirms, run exactly:
 python scripts/mobile_release.py release --batch <batch-id> --json
 ```
 
-Release ends after all configured CodeMagic check runs are detected. Report each
-check name, state, and URL. A failed run still counts as detected. Do not wait for
-the builds to finish.
+Release ends once a CodeMagic build has started. Report each detected check name,
+state, and URL, and name any configured check that had not registered yet. A failed
+run still counts as detected. Do not wait for the builds to finish.
 
 ## Quick reference
 
@@ -56,7 +56,7 @@ the builds to finish.
 | App skipped | Keep it in the summary with its recorded reason. Never merge it. |
 | `no releasable changes` | Show `unreleased_commits` and get the skip approved before `release`. |
 | `partial-release` | Name merged and remaining apps, then resume the same batch with `release` only after reporting the failure. |
-| CodeMagic timeout | Report `released-builds-unverified`, tag and commit URLs, and seen or missing checks. Resume observation with `status`. |
+| No build started | Report `released-builds-unverified`, tag and commit URLs, and the missing checks. Resume observation with `status`. |
 | Preserved worktree | Report its path and leave it untouched. |
 
 Use `python scripts/mobile_release.py status --batch <batch-id> --json` for read-only

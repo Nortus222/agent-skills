@@ -97,7 +97,7 @@ def _batch_warnings(batch: dict[str, Any]) -> list[str]:
         if app.get("worktree"):
             warnings.append(f"{app_key}: preserved worktree {app['worktree']}")
     if batch.get("state") == "released-builds-unverified":
-        warnings.append("CodeMagic checks were not all detected before timeout")
+        warnings.append("no CodeMagic build had started before timeout")
     return warnings
 
 
