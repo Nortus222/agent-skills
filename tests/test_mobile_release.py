@@ -1086,6 +1086,7 @@ def successful_preflight_responses(app_count=3):
                     "",
                 ),
                 CommandResult(0, "[]\n", ""),
+                CommandResult(0, "", ""),
             ]
         )
     return responses
@@ -1193,6 +1194,33 @@ class PreflightTests(unittest.TestCase):
         ):
             operator.preflight(["pocket-manage"])
 
+    def test_preflight_rejects_a_repository_that_does_not_ignore_the_deployment_worktree(self):
+        responses = successful_preflight_responses(app_count=1)
+        responses[15] = CommandResult(1, "", "")
+        operator = make_operator(responses)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(
+            ReleaseError,
+            r"MarketplaceSoftware/pocketmanage: \.claude/worktrees is not ignored",
+        ):
+            operator.preflight(["pocket-manage"])
+
+    def test_preflight_skips_the_ignore_check_when_the_submodule_pointer_is_current(self):
+        responses = successful_preflight_responses(app_count=1)
+        responses[11] = CommandResult(0, f"{'c' * 40}\n", "")
+        operator = make_operator(responses)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.preflight(["pocket-manage"])
+
+        self.assertFalse(
+            any(
+                call.args == ("git", "check-ignore", "-q", ".claude/worktrees")
+                for call in operator.runner.calls
+            )
+        )
+
     def test_preflight_records_exact_remote_shas_for_every_app(self):
         operator = make_operator(successful_preflight_responses())
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1249,7 +1277,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_duplicate_dev_to_release_prs(self):
         responses = successful_preflight_responses(app_count=1)
-        responses[-1] = CommandResult(
+        responses[14] = CommandResult(
             0,
             json.dumps(
                 [
@@ -1291,7 +1319,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_workflow_names_found_only_in_nested_fields(self):
         responses = successful_preflight_responses(app_count=1)
-        responses[-2] = CommandResult(
+        responses[13] = CommandResult(
             0,
             "\n".join(
                 [
