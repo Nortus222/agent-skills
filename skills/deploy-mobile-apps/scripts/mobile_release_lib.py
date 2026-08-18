@@ -1187,7 +1187,9 @@ class ReleaseOperator:
         ).stdout
         if not worktree_status.strip():
             self._run(
-                ["git", "worktree", "remove", str(worktree_path)],
+                # Git refuses to remove a worktree holding an initialised submodule;
+                # the clean status checked above is what makes forcing safe here.
+                ["git", "worktree", "remove", "--force", str(worktree_path)],
                 cwd=repository_path,
                 repository=app.repository,
                 mutates=True,
