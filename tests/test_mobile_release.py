@@ -400,6 +400,12 @@ class PreparationRunner:
             output = "?? unexpected.txt\n" if self.dirty_worktree else ""
             return CommandResult(0, output, "")
         if command[:3] == ("git", "worktree", "remove"):
+            if "--force" not in command:
+                return CommandResult(
+                    128,
+                    "",
+                    "fatal: working trees containing submodules cannot be moved or removed",
+                )
             return CommandResult(0, "", "")
         if command[:3] == ("gh", "run", "list"):
             return CommandResult(
@@ -955,10 +961,6 @@ def command_args(calls):
     return [list(call.args) for call in calls]
 
 
-def flatten_command_args(calls):
-    return [argument for call in calls for argument in call.args]
-
-
 def prepared_operator(
     *,
     submodule_changed=True,
@@ -1439,7 +1441,8 @@ class PrepareTests(unittest.TestCase):
         calls = command_args(operator.runner.calls)
         self.assertIn(["git", "add", "--", "packages"], calls)
         self.assertIn(["git", "push", "origin", "HEAD:dev"], calls)
-        self.assertNotIn("--force", flatten_command_args(operator.runner.calls))
+        forced = [call.args for call in operator.runner.calls if "--force" in call.args]
+        self.assertEqual([args[:3] for args in forced], [("git", "worktree", "remove")])
         self.assertEqual(result["apps"]["pocket-manage"]["dev_push"], "pushed")
 
     def test_prepare_reports_no_release_changes_as_skip(self):
@@ -1606,6 +1609,16 @@ class PrepareTests(unittest.TestCase):
         self.assertFalse(
             any(call.args[:3] == ("git", "worktree", "remove") for call in operator.runner.calls)
         )
+
+    def test_prepare_removes_the_worktree_holding_the_packages_submodule(self):
+        operator, batch = prepared_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"])
+
+        app = result["apps"]["pocket-manage"]
+        self.assertIsNone(app["worktree"])
+        self.assertEqual(app["status"], "prepared")
 
     def test_prepare_resumes_after_completed_preparation_merge(self):
         operator, batch = prepared_operator(resumed=True)
