@@ -20,6 +20,12 @@ from urllib.parse import urlsplit
 
 
 _PROMOTED_COMMIT_LIMIT = 20
+_CARRIED_SUBJECT_LIMIT = 20
+# Captures the type and summary while dropping any breaking marker, so a bump
+# commit rendered from these can never read as a breaking change.
+_CONVENTIONAL_SUBJECT = re.compile(
+    r"(?P<type>feat|fix)(?:\([^)]*\))?!?:\s*(?P<summary>.+)"
+)
 
 PACKAGES_REPOSITORY = "MarketplaceSoftware/packages"
 
@@ -1112,6 +1118,7 @@ class ReleaseOperator:
         )
         branch = f"deploy-mobile-apps/{batch['batch_id']}/{app.key}"
         app_record["worktree"] = str(worktree_path)
+        bump_message = self._submodule_bump_message(app, app_record, repository_path)
         mutation_commands = [
             ["git", "worktree", "add", "-b", branch, str(worktree_path), app_record["dev_sha"]],
             ["git", "submodule", "update", "--init", "--", app.submodule_path],
@@ -1124,7 +1131,7 @@ class ReleaseOperator:
                 app_record["submodule_after"],
             ],
             ["git", "add", "--", app.submodule_path],
-            ["git", "commit", "-m", "chore: update shared packages"],
+            ["git", "commit", "-m", bump_message],
             ["git", "push", "origin", f"HEAD:{app.dev_branch}"],
         ]
         self._verify_deployment_worktree_is_ignored(app, repository_path)
@@ -1783,6 +1790,49 @@ class ReleaseOperator:
                 raise ReleaseError(
                     f"repository {app.repository}: conflicting deployment worktree {path}"
                 )
+
+    def _submodule_bump_message(
+        self, app: AppConfig, app_record: dict[str, Any], repository_path: Path
+    ) -> str:
+        """Type the bump by the work it carries, so a shared fix still cuts a release.
+
+        A bump is never breaking. Whether a change breaks the package says nothing
+        about whether it breaks the app, and no automated commit should cut a major.
+        """
+        result = self.runner.run(
+            [
+                "git",
+                "log",
+                "--format=%s",
+                f"{app_record['submodule_before']}..{app_record['submodule_after']}",
+            ],
+            cwd=repository_path / app.submodule_path,
+        )
+        if result.returncode != 0:
+            return "chore: update shared packages"
+
+        carried = []
+        kind = "chore"
+        for subject in result.stdout.splitlines():
+            match = _CONVENTIONAL_SUBJECT.match(subject.strip())
+            if match is None:
+                continue
+            if match.group("type") == "feat":
+                kind = "feat"
+            elif kind != "feat":
+                kind = "fix"
+            carried.append(f"{match.group('type')}: {match.group('summary')}")
+
+        summary = f"{kind}: update shared packages"
+        if not carried:
+            return summary
+        shown = carried[:_CARRIED_SUBJECT_LIMIT]
+        remainder = len(carried) - len(shown)
+        lines = [summary, "", f"Carried from {app_record['submodule_after'][:7]}:", ""]
+        lines.extend(f"- {subject}" for subject in shown)
+        if remainder:
+            lines.append(f"- and {remainder} more")
+        return "\n".join(lines)
 
     def _verify_deployment_worktree_is_ignored(
         self, app: AppConfig, repository_path: Path

@@ -321,6 +321,7 @@ class PreparationRunner:
         release_contains_dev=False,
         release_object_requires_fetch=False,
         merge_conflict=False,
+        carried_commits=None,
         dirty_worktree=False,
         push_rejected=False,
         promotion_head_race=False,
@@ -339,6 +340,11 @@ class PreparationRunner:
         self.release_object_requires_fetch = release_object_requires_fetch
         self.promotion_refs_fetched = False
         self.merge_conflict = merge_conflict
+        self.carried_commits = (
+            ["fix: show every delivery group's cartons"]
+            if carried_commits is None
+            else carried_commits
+        )
         self.dirty_worktree = dirty_worktree
         self.push_rejected = push_rejected
         self.promotion_head_race = promotion_head_race
@@ -387,7 +393,9 @@ class PreparationRunner:
             return CommandResult(0, "", "")
         if command == ("git", "diff", "--cached", "--name-only"):
             return CommandResult(0, "packages\n", "")
-        if command == ("git", "commit", "-m", "chore: update shared packages"):
+        if command[:3] == ("git", "log", "--format=%s"):
+            return CommandResult(0, "\n".join(self.carried_commits) + "\n", "")
+        if command[:2] == ("git", "commit"):
             return CommandResult(0, "", "")
         if command == ("git", "rev-parse", "HEAD^{commit}"):
             return CommandResult(0, f"{'1' * 40}\n", "")
@@ -980,6 +988,7 @@ def prepared_operator(
     release_contains_dev=False,
     release_object_requires_fetch=False,
     merge_conflict=False,
+    carried_commits=None,
     dirty_worktree=False,
     push_rejected=False,
     promotion_head_race=False,
@@ -1006,6 +1015,7 @@ def prepared_operator(
         release_contains_dev=release_contains_dev,
         release_object_requires_fetch=release_object_requires_fetch,
         merge_conflict=merge_conflict,
+        carried_commits=carried_commits,
         dirty_worktree=dirty_worktree,
         push_rejected=push_rejected,
         promotion_head_race=promotion_head_race,
@@ -1653,6 +1663,61 @@ class PrepareTests(unittest.TestCase):
             if call.args[:3] == ("gh", "pr", "merge")
         )
         self.assertIn("--admin", merge.args)
+
+    def _bump_commit_message(self, operator):
+        commit = next(
+            call for call in operator.runner.calls if call.args[:2] == ("git", "commit")
+        )
+        return commit.args[commit.args.index("-m") + 1]
+
+    def test_a_bump_carrying_a_feature_is_committed_as_a_feature(self):
+        operator, batch = prepared_operator(
+            carried_commits=["feat: new telemetry module", "fix: text size"]
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        message = self._bump_commit_message(operator)
+        self.assertTrue(message.startswith("feat: update shared packages"), message)
+        self.assertIn("feat: new telemetry module", message)
+
+    def test_a_bump_carrying_only_fixes_is_committed_as_a_fix(self):
+        operator, batch = prepared_operator(
+            carried_commits=["fix: text size", "fix: wo approval"]
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        self.assertTrue(
+            self._bump_commit_message(operator).startswith("fix: update shared packages")
+        )
+
+    def test_a_bump_carrying_no_releasable_work_stays_a_chore(self):
+        operator, batch = prepared_operator(
+            carried_commits=["chore: bump lints", "docs: readme"]
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        self.assertTrue(
+            self._bump_commit_message(operator).startswith("chore: update shared packages")
+        )
+
+    def test_a_bump_carrying_a_breaking_change_never_cuts_a_major(self):
+        operator, batch = prepared_operator(
+            carried_commits=["feat!: drop the legacy client", "fix: text size"]
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        message = self._bump_commit_message(operator)
+        self.assertTrue(message.startswith("feat: update shared packages"), message)
+        self.assertNotIn("BREAKING CHANGE:", message)
+        self.assertNotIn("!:", message.splitlines()[0])
 
     def test_prepare_deletes_the_deployment_branch_with_its_worktree(self):
         operator, batch = prepared_operator()
