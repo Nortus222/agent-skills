@@ -217,6 +217,8 @@ class ReleaseOperator:
             app = self.inventory.apps[app_key]
             repository_path = repositories[app_key]
             app_record = self._preflight_app(app, repository_path)
+            if app_record["packages_pointer_sha"] != app_record["packages_sha"]:
+                self._verify_deployment_worktree_is_ignored(app, repository_path)
             batch["apps"][app_key] = app_record
 
         batch["state"] = "preflight-complete"
@@ -1119,11 +1121,7 @@ class ReleaseOperator:
             ["git", "commit", "-m", "chore: update shared packages"],
             ["git", "push", "origin", f"HEAD:{app.dev_branch}"],
         ]
-        self._run(
-            ["git", "check-ignore", "-q", ".claude/worktrees"],
-            cwd=repository_path,
-            repository=app.repository,
-        )
+        self._verify_deployment_worktree_is_ignored(app, repository_path)
         if dry_run:
             app_record["planned_commands"].extend(mutation_commands)
             app_record["dev_push"] = "planned"
@@ -1738,6 +1736,19 @@ class ReleaseOperator:
                 raise ReleaseError(
                     f"repository {app.repository}: conflicting deployment worktree {path}"
                 )
+
+    def _verify_deployment_worktree_is_ignored(
+        self, app: AppConfig, repository_path: Path
+    ) -> None:
+        """Preparation adds .claude/worktrees inside the checkout; it must stay untracked."""
+        result = self.runner.run(
+            ["git", "check-ignore", "-q", ".claude/worktrees"], cwd=repository_path
+        )
+        if result.returncode != 0:
+            raise ReleaseError(
+                f"repository {app.repository}: .claude/worktrees is not ignored; "
+                "add `.claude/worktrees` to .gitignore before preparing"
+            )
 
     def _run(
         self,
