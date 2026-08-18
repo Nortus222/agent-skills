@@ -399,6 +399,8 @@ class PreparationRunner:
         if command == ("git", "status", "--porcelain"):
             output = "?? unexpected.txt\n" if self.dirty_worktree else ""
             return CommandResult(0, output, "")
+        if command[:3] == ("git", "branch", "-D"):
+            return CommandResult(0, "", "")
         if command[:3] == ("git", "worktree", "remove"):
             if "--force" not in command:
                 return CommandResult(
@@ -1378,6 +1380,20 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("authentication failed", str(raised.exception))
         self.assertNotIn(short_key, str(raised.exception))
 
+    def test_command_failure_keeps_identifiers_beside_mundane_environment_values(self):
+        sha = "2684bfaa406bb9c57b519b969a4f5c142ae34d6a"
+        operator = make_operator(
+            [CommandResult(1, "", f"merge of {sha} failed")],
+            environment={"CLICOLOR": "0", "PYTHONUNBUFFERED": "1"},
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaises(ReleaseError) as raised:
+            operator.preflight(["pocket-manage"])
+
+        self.assertIn(sha, str(raised.exception))
+
+
 
 class PrepareTests(unittest.TestCase):
     def test_prepare_dry_run_and_execution_use_the_same_guarded_merge_command(self):
@@ -1620,6 +1636,35 @@ class PrepareTests(unittest.TestCase):
         self.assertIsNone(app["worktree"])
         self.assertEqual(app["status"], "prepared")
 
+    def test_prepare_merges_the_preparation_pr_with_administrator_privileges(self):
+        operator, batch = prepared_operator(existing_pr=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        merge = next(
+            call
+            for call in operator.runner.calls
+            if call.args[:3] == ("gh", "pr", "merge")
+        )
+        self.assertIn("--admin", merge.args)
+
+    def test_prepare_deletes_the_deployment_branch_with_its_worktree(self):
+        operator, batch = prepared_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        branch = f"deploy-mobile-apps/{batch['batch_id']}/pocket-manage"
+        self.assertIn(["git", "branch", "-D", branch], command_args(operator.runner.calls))
+
+    def test_prepare_names_why_the_preparation_pr_is_not_mergeable(self):
+        operator, batch = prepared_operator(existing_pr=True, merge_conflict=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaisesRegex(ReleaseError, "not mergeable.*CONFLICTING.*DIRTY"):
+            operator.prepare(batch["batch_id"])
+
     def test_prepare_resumes_after_completed_preparation_merge(self):
         operator, batch = prepared_operator(resumed=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1845,6 +1890,7 @@ class ReleaseTests(unittest.TestCase):
                         "--repo",
                         "MarketplaceSoftware/pocketmanage",
                         "--merge",
+                        "--admin",
                         "--match-head-commit",
                         "a" * 40,
                     ],
