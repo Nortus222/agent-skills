@@ -746,24 +746,25 @@ class ReleaseOperator:
         )
         self.store.save(batch)
         checks, missing_checks = self._wait_for_codemagic_checks(app, tag_commit_sha)
-        if missing_checks:
+        if not checks:
             app_record.update(
                 {
                     "build_verification": "unverified",
-                    "codemagic_checks": checks,
+                    "codemagic_checks": {},
                     "codemagic_missing_checks": missing_checks,
                     "state": "released-builds-unverified",
                     "status": "released",
-                    "result": "released; CodeMagic build startup unverified",
+                    "error": None,
+                    "result": "released; no CodeMagic build had started",
                 }
             )
             return False
 
         app_record.update(
             {
-                "build_verification": "verified",
+                "build_verification": "started" if missing_checks else "verified",
                 "codemagic_checks": checks,
-                "codemagic_missing_checks": [],
+                "codemagic_missing_checks": missing_checks,
                 "state": "released",
                 "status": "released",
                 "error": None,
@@ -773,11 +774,21 @@ class ReleaseOperator:
         return True
 
     def _resolve_tag_commit(self, app: AppConfig, tag: str) -> str:
+        command = ["gh", "api", f"repos/{app.repository}/git/ref/tags/{tag}"]
+        deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
+        while True:
+            # Release Please tags after its pull request merges, so the tag is
+            # absent for a moment rather than wrong.
+            result = self.runner.run(command)
+            if result.returncode == 0:
+                break
+            if self.clock.monotonic() >= deadline:
+                raise ReleaseError(
+                    self._command_error(app.repository, command, result)
+                )
+            self.clock.sleep(self.poll_policy.interval_seconds)
         reference = self._load_json(
-            self._run(
-                ["gh", "api", f"repos/{app.repository}/git/ref/tags/{tag}"],
-                repository=app.repository,
-            ).stdout,
+            result.stdout,
             repository=app.repository,
             subject="tag reference response",
         )
@@ -872,8 +883,10 @@ class ReleaseOperator:
             missing = [
                 name for name in self.inventory.codemagic_checks if name not in observed
             ]
-            if not missing:
-                return observed, []
+            # A started build proves CodeMagic reacted to the tag. The rest register
+            # minutes later, and a release should not be held open watching for them.
+            if observed:
+                return observed, missing
             if self.clock.monotonic() >= deadline:
                 return observed, missing
             self.clock.sleep(self.poll_policy.interval_seconds)
@@ -1400,6 +1413,9 @@ class ReleaseOperator:
             raise ReleaseError(
                 f"repository {app.repository}: invalid preparation pull request response"
             )
+        pull_request_state = self._await_known_mergeability(
+            app, number, pull_request_state
+        )
         self._validate_exact_preparation_pr(app, pull_request_state, dev_sha)
         if (
             pull_request_state.get("state") != "OPEN"
@@ -1442,6 +1458,38 @@ class ReleaseOperator:
         app_record["status"] = "prepared"
         app_record["state"] = "prepare-complete"
         app_record["error"] = None
+
+    def _await_known_mergeability(
+        self, app: AppConfig, number: str, pull_request: dict[str, Any]
+    ) -> dict[str, Any]:
+        """GitHub computes mergeability asynchronously; not yet known is not a refusal."""
+        deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
+        while pull_request.get("mergeable") == "UNKNOWN":
+            if self.clock.monotonic() >= deadline:
+                return pull_request
+            self.clock.sleep(self.poll_policy.interval_seconds)
+            refreshed = self._load_json(
+                self._run(
+                    [
+                        "gh",
+                        "pr",
+                        "view",
+                        number,
+                        "--repo",
+                        app.repository,
+                        "--json",
+                        "number,url,state,mergedAt,mergeable,mergeStateStatus,"
+                        "headRefName,headRefOid,baseRefName",
+                    ],
+                    repository=app.repository,
+                ).stdout,
+                repository=app.repository,
+                subject="preparation pull request response",
+            )
+            if not isinstance(refreshed, dict):
+                return pull_request
+            pull_request = refreshed
+        return pull_request
 
     def _list_preparation_pull_requests(self, app: AppConfig) -> list[dict[str, Any]]:
         response = self._load_json(
