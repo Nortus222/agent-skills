@@ -661,6 +661,8 @@ class ReleaseRunner:
         codemagic_checks="queued",
         resumed_merge=False,
         merge_confirmation_fails=False,
+        no_release_checks=False,
+        release_mergeable="MERGEABLE",
         extra_label=False,
         head_race=False,
         already_merged=False,
@@ -677,6 +679,8 @@ class ReleaseRunner:
         self.missing_release = missing_release
         self.codemagic_checks = codemagic_checks
         self.merge_confirmation_fails = merge_confirmation_fails
+        self.no_release_checks = no_release_checks
+        self.release_mergeable = release_mergeable
         self.extra_label = extra_label
         self.head_race = head_race
         self.successful_merges = []
@@ -703,13 +707,17 @@ class ReleaseRunner:
             if self.merge_confirmation_fails and repository in self.merged:
                 return CommandResult(1, "", "temporary read failure")
             head = self.current_head or "a" * 40
-            checks = [
-                {
-                    "name": "release-please",
-                    "status": "COMPLETED",
-                    "conclusion": "FAILURE" if self.failed_checks else "SUCCESS",
-                }
-            ]
+            checks = (
+                []
+                if self.no_release_checks
+                else [
+                    {
+                        "name": "release-please",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE" if self.failed_checks else "SUCCESS",
+                    }
+                ]
+            )
             return CommandResult(
                 0,
                 json.dumps(
@@ -726,6 +734,7 @@ class ReleaseRunner:
                             *([{"name": "unexpected"}] if self.extra_label else []),
                         ],
                         "statusCheckRollup": checks,
+                        "mergeable": self.release_mergeable,
                         "mergeCommit": {
                             "oid": self.merge_shas[repository]
                         }
@@ -888,6 +897,8 @@ def awaiting_approval_operator(
     codemagic_checks="queued",
     resumed_merge=False,
     merge_confirmation_fails=False,
+    no_release_checks=False,
+    release_mergeable="MERGEABLE",
     extra_label=False,
     head_race=False,
     already_merged=False,
@@ -910,6 +921,8 @@ def awaiting_approval_operator(
         codemagic_checks=codemagic_checks,
         resumed_merge=resumed_merge,
         merge_confirmation_fails=merge_confirmation_fails,
+        no_release_checks=no_release_checks,
+        release_mergeable=release_mergeable,
         extra_label=extra_label,
         head_race=head_race,
         already_merged=already_merged,
@@ -945,7 +958,9 @@ def awaiting_approval_operator(
             "version": versions[app_key],
             "release_pr_number": index,
             "release_pr_url": f"https://github.com/{app.repository}/pull/{index}",
-            "release_pr_checks": [
+            "release_pr_checks": []
+            if no_release_checks
+            else [
                 {
                     "name": "release-please",
                     "status": "COMPLETED",
@@ -2141,6 +2156,44 @@ class ReleaseTests(unittest.TestCase):
         )
         self.assertIn("--match-head-commit", merge.args)
         self.assertEqual(merge.args[-1], "a" * 40)
+
+    def test_release_proceeds_when_the_release_pr_carries_no_checks(self):
+        operator, batch = awaiting_approval_operator(no_release_checks=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        self.assertEqual(result["apps"]["pocket-manage"]["release_merge"], "merged")
+
+    def test_release_refuses_an_uncheckable_pr_github_will_not_merge(self):
+        operator, batch = awaiting_approval_operator(
+            no_release_checks=True, release_mergeable="CONFLICTING"
+        )
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        with self.assertRaises(ReleaseError):
+            operator.release(batch["batch_id"])
+
+        self.assertFalse(
+            any(call.args[:3] == ("gh", "pr", "merge") for call in operator.runner.calls)
+        )
+
+    def test_checks_failing_since_approval_are_named_as_checks(self):
+        operator, batch = awaiting_approval_operator(failed_checks=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        approved = operator.store.load(batch["batch_id"])
+        for record in approved["apps"].values():
+            record["release_pr_checks"] = [
+                {
+                    "name": "release-please",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                }
+            ]
+        operator.store.save(approved)
+
+        with self.assertRaisesRegex(ReleaseError, "checks are not passing"):
+            operator.release(batch["batch_id"])
 
     def test_head_race_rejection_records_no_successful_merge(self):
         operator, batch = awaiting_approval_operator(head_race=True)
