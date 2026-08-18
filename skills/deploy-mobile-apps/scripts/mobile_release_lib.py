@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 
 _PROMOTED_COMMIT_LIMIT = 20
+_CHECKS_NOT_PASSING = "release pull request checks are not passing"
 _CARRIED_SUBJECT_LIMIT = 20
 # Captures the type and summary while dropping any breaking marker, so a bump
 # commit rendered from these can never read as a breaking change.
@@ -366,6 +367,7 @@ class ReleaseOperator:
         ]
         unfinished = []
         approval_changed = False
+        checks_blocked = False
         for app_key in included:
             app = self.inventory.apps[app_key]
             app_record = batch["apps"][app_key]
@@ -409,14 +411,21 @@ class ReleaseOperator:
             if not self._approval_snapshot_matches(app, app_record, snapshot):
                 self._replace_approval_snapshot(app_record, snapshot)
                 approval_changed = True
+            elif not _release_checks_allow_merge(snapshot):
+                self._replace_approval_snapshot(
+                    app_record, snapshot, result=_CHECKS_NOT_PASSING
+                )
+                checks_blocked = True
             unfinished.append((app, app_record))
 
-        if approval_changed:
+        if approval_changed or checks_blocked:
             batch["state"] = "awaiting-approval"
             if not dry_run:
                 self.store.save(batch)
             raise ReleaseError(
-                f"batch {batch_id}: approval snapshot changed; review and approve again",
+                f"batch {batch_id}: approval snapshot changed; review and approve again"
+                if approval_changed
+                else f"batch {batch_id}: {_CHECKS_NOT_PASSING}",
                 recovery_batch=batch,
             )
 
@@ -533,6 +542,7 @@ class ReleaseOperator:
                 pull_request.get("labels", [])
             ),
             "release_pr_checks": pull_request.get("statusCheckRollup", []),
+            "release_pr_mergeable": pull_request.get("mergeable"),
             "release_pr_head_sha": head_sha,
             "release_pr_merge_sha": (
                 pull_request["mergeCommit"].get("oid")
@@ -555,7 +565,7 @@ class ReleaseOperator:
                     "--repo",
                     app.repository,
                     "--json",
-                    "number,url,state,headRefOid,baseRefName,labels,statusCheckRollup,mergeCommit",
+                    "number,url,state,headRefOid,baseRefName,labels,statusCheckRollup,mergeable,mergeCommit",
                 ],
                 repository=app.repository,
             ).stdout,
@@ -589,7 +599,6 @@ class ReleaseOperator:
             and snapshot["release_pr_head_sha"]
             == app_record.get("release_pr_head_sha")
             and checks == app_record.get("release_pr_checks")
-            and _release_checks_pass(checks)
         )
 
     @staticmethod
@@ -614,14 +623,16 @@ class ReleaseOperator:
 
     @staticmethod
     def _replace_approval_snapshot(
-        app_record: dict[str, Any], snapshot: dict[str, Any]
+        app_record: dict[str, Any],
+        snapshot: dict[str, Any],
+        result: str = "approval snapshot changed",
     ) -> None:
         app_record.update(snapshot)
         app_record.update(
             {
                 "state": "awaiting-approval",
                 "status": "prepared",
-                "result": "approval snapshot changed",
+                "result": result,
             }
         )
 
@@ -1937,6 +1948,14 @@ def _release_label_names(labels: Any) -> list[str] | None:
     ):
         return None
     return sorted({label["name"] for label in labels})
+
+
+def _release_checks_allow_merge(snapshot: dict[str, Any]) -> bool:
+    """A pull request with no checks is only mergeable if GitHub says so itself."""
+    checks = snapshot.get("release_pr_checks")
+    if _release_checks_pass(checks):
+        return True
+    return not checks and snapshot.get("release_pr_mergeable") == "MERGEABLE"
 
 
 def _release_checks_pass(checks: Any) -> bool:
