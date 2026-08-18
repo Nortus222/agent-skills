@@ -589,6 +589,10 @@ class DiscoveryRunner:
                 ),
                 "",
             )
+        if command[:2] == ("gh", "api") and "/compare/" in command[2]:
+            return CommandResult(
+                0, json.dumps(["chore: notifications", "chore: migrate more pages"]), ""
+            )
         if command[:3] == ("gh", "pr", "list"):
             app_key = next(
                 key
@@ -853,6 +857,7 @@ def operator_after_preparation(*, no_release_pr_for=None):
             "status": "prepared",
             "repository": app.repository,
             "release_sha": "e" * 40,
+            "release_sha_before": "d" * 40,
             "packages_sha": "f" * 40,
         }
     store.save(batch)
@@ -1777,6 +1782,25 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(result["apps"]["installers"]["version"], "1.3.0")
 
+    def test_a_skipped_app_records_the_commits_that_produced_no_version(self):
+        operator, batch = operator_after_preparation(no_release_pr_for="partner")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.discover_versions(batch)
+
+        self.assertEqual(
+            result["apps"]["partner"]["unreleased_commits"],
+            ["chore: notifications", "chore: migrate more pages"],
+        )
+
+    def test_a_released_app_records_no_unreleased_commits(self):
+        operator, batch = operator_after_preparation(no_release_pr_for="partner")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.discover_versions(batch)
+
+        self.assertEqual(result["apps"]["installers"].get("unreleased_commits", []), [])
+
     def test_approval_rows_include_complete_release_snapshot_data(self):
         operator, batch = operator_after_preparation()
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1798,6 +1822,7 @@ class DiscoveryTests(unittest.TestCase):
                     "head_sha": "a" * 40,
                     "submodule_sha": "f" * 40,
                     "result": "ready for approval",
+                    "unreleased_commits": [],
                 }
             ],
         )

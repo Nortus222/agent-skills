@@ -19,6 +19,8 @@ from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 
+_PROMOTED_COMMIT_LIMIT = 20
+
 PACKAGES_REPOSITORY = "MarketplaceSoftware/packages"
 
 
@@ -299,6 +301,9 @@ class ReleaseOperator:
                         "status": "skipped",
                         "skip_reason": "no releasable changes",
                         "result": "no releasable changes",
+                        "unreleased_commits": self._promoted_commit_subjects(
+                            app, app_record
+                        ),
                     }
                 )
                 self.store.save(batch)
@@ -1015,6 +1020,7 @@ class ReleaseOperator:
         app_record.setdefault("dev_push", "pending")
         app_record.setdefault("preparation_pr", app_record.get("dev_to_release_pr"))
         app_record.setdefault("release_sha", app_record["release_sha"])
+        app_record.setdefault("release_sha_before", app_record["release_sha"])
         app_record.setdefault("status", "pending")
         app_record.setdefault("error", None)
         app_record.setdefault("planned_commands", [])
@@ -1701,6 +1707,37 @@ class ReleaseOperator:
             "dev_to_release_pr": pull_requests[0] if pull_requests else None,
         }
 
+    def _promoted_commit_subjects(
+        self, app: AppConfig, app_record: dict[str, Any]
+    ) -> list[str]:
+        """Commits this batch promoted, so an operator can spot work typed as a chore.
+
+        Reporting only: a comparison this cannot read leaves the skip unexplained
+        rather than failing the batch.
+        """
+        before = app_record.get("release_sha_before")
+        after = app_record.get("release_sha")
+        if not before or not after or before == after:
+            return []
+        result = self.runner.run(
+            [
+                "gh",
+                "api",
+                f"repos/{app.repository}/compare/{before}...{after}",
+                "--jq",
+                '[.commits[].commit.message | split("\n")[0]]',
+            ]
+        )
+        if result.returncode != 0:
+            return []
+        try:
+            subjects = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(subjects, list):
+            return []
+        return [str(subject) for subject in subjects][:_PROMOTED_COMMIT_LIMIT]
+
     def _verify_repository_permission(self, app: AppConfig) -> None:
         response = self._load_json(
             self._run(
@@ -1817,6 +1854,7 @@ def approval_rows(batch: dict[str, Any]) -> list[dict[str, Any]]:
                 "head_sha": app.get("release_pr_head_sha"),
                 "submodule_sha": app.get("submodule_sha", app.get("packages_sha")),
                 "result": app.get("result", app.get("skip_reason")),
+                "unreleased_commits": app.get("unreleased_commits", []),
             }
         )
     return rows
