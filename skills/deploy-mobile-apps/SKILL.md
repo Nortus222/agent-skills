@@ -19,6 +19,10 @@ python scripts/mobile_release.py preflight --json
 python scripts/mobile_release.py prepare --batch <batch-id> --json
 ```
 
+Promotion and release merges carry administrator privileges, because the `release`
+branch requires an approving review that the release account cannot give its own pull
+request. The matched head commit stays the only approval boundary.
+
 Stop when the state is `awaiting-approval`. Print one summary with these fields for
 every selected app: app, proposed version, Release Please PR number and URL, checks,
 head SHA, submodule SHA, and result or skip reason. Also print the batch ID, state,

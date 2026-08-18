@@ -1194,6 +1194,12 @@ class ReleaseOperator:
                 repository=app.repository,
                 mutates=True,
             )
+            self._run(
+                ["git", "branch", "-D", branch],
+                cwd=repository_path,
+                repository=app.repository,
+                mutates=True,
+            )
             app_record["worktree"] = None
 
     def _promote_development(
@@ -1377,7 +1383,9 @@ class ReleaseOperator:
             or pull_request_state.get("mergeStateStatus") == "DIRTY"
         ):
             raise ReleaseError(
-                f"repository {app.repository}: preparation pull request is not mergeable"
+                f"repository {app.repository}: preparation pull request is not mergeable "
+                f"({pull_request_state.get('mergeable')}/"
+                f"{pull_request_state.get('mergeStateStatus')})"
             )
 
         if dry_run:
@@ -1772,7 +1780,11 @@ class ReleaseOperator:
 
     def _redact(self, text: str) -> str:
         values = sorted(
-            {value for value in self.environ.values() if value},
+            {
+                value
+                for name, value in self.environ.items()
+                if value and _carries_a_secret(name, value)
+            },
             key=len,
             reverse=True,
         )
@@ -1856,6 +1868,17 @@ def _remote_tracking_refspec(branch: str) -> str:
     return f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
 
 
+_SECRET_ENVIRONMENT_NAME = re.compile(
+    r"TOKEN|SECRET|KEY|PASSWORD|PASSPHRASE|CREDENTIAL", re.IGNORECASE
+)
+_OPAQUE_VALUE_LENGTH = 8
+
+
+def _carries_a_secret(name: str, value: str) -> bool:
+    """Short mundane values such as 1 or 0 corrupt the shas and ids they appear inside."""
+    return bool(_SECRET_ENVIRONMENT_NAME.search(name)) or len(value) >= _OPAQUE_VALUE_LENGTH
+
+
 def _guarded_merge_command(
     repository: str,
     pull_request_number: str,
@@ -1869,6 +1892,9 @@ def _guarded_merge_command(
         "--repo",
         repository,
         "--merge",
+        # release branches require an approving review the release account cannot
+        # give itself, so the guarded merge carries administrator privileges.
+        "--admin",
         "--match-head-commit",
         head_sha,
     ]
