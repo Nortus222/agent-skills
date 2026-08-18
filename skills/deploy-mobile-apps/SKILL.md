@@ -28,8 +28,13 @@ every selected app: app, proposed version, Release Please PR number and URL, che
 head SHA, submodule SHA, and result or skip reason. Also print the batch ID, state,
 warnings, preserved worktree paths, and next command.
 
+An app skipped for `no releasable changes` carries `unreleased_commits`: the commits
+this batch promoted that produced no version. List them under that app and ask the
+user to approve the skip. A commit describing user-visible work is a `feat` or a `fix`
+typed as something else, and the fix is a corrected commit, not an approved skip.
+
 Ask for one explicit confirmation of that batch. Confirmation covers only the shown
-PR numbers, versions, and head SHAs. Do not run `release` in the same response that
+PR numbers, versions, head SHAs, and approved skips. Do not run `release` in the same response that
 asks for confirmation.
 
 After the user confirms, run exactly:
@@ -49,6 +54,7 @@ the builds to finish.
 | `awaiting-approval` | Show the complete batch summary and pause. |
 | Approval snapshot changed | Refuse the changed Release Please head, show the refreshed summary, and request new confirmation. |
 | App skipped | Keep it in the summary with its recorded reason. Never merge it. |
+| `no releasable changes` | Show `unreleased_commits` and get the skip approved before `release`. |
 | `partial-release` | Name merged and remaining apps, then resume the same batch with `release` only after reporting the failure. |
 | CodeMagic timeout | Report `released-builds-unverified`, tag and commit URLs, and seen or missing checks. Resume observation with `status`. |
 | Preserved worktree | Report its path and leave it untouched. |
