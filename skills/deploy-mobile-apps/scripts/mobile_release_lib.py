@@ -79,6 +79,10 @@ class SystemClock:
 class PollPolicy:
     interval_seconds: float = 5.0
     timeout_seconds: float = 300.0
+    # CodeMagic queues builds, and a queued build registers no check run. Waiting
+    # the full timeout cannot outlast a queue, so observation gets its own budget
+    # and `status` is the way to watch from there.
+    observation_timeout_seconds: float = 60.0
 
 
 class SubprocessRunner:
@@ -755,7 +759,7 @@ class ReleaseOperator:
                     "state": "released-builds-unverified",
                     "status": "released",
                     "error": None,
-                    "result": "released; no CodeMagic build had started",
+                    "result": "released; no CodeMagic build observed yet",
                 }
             )
             return False
@@ -828,7 +832,9 @@ class ReleaseOperator:
     def _wait_for_codemagic_checks(
         self, app: AppConfig, commit_sha: str
     ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-        deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
+        deadline = (
+            self.clock.monotonic() + self.poll_policy.observation_timeout_seconds
+        )
         command = [
             "gh",
             "api",

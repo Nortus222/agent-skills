@@ -946,7 +946,9 @@ def awaiting_approval_operator(
         runner=runner,
         environ={},
         clock=clock,
-        poll_policy=PollPolicy(interval_seconds=2, timeout_seconds=4),
+        poll_policy=PollPolicy(
+            interval_seconds=2, timeout_seconds=4, observation_timeout_seconds=4
+        ),
     )
     operator._test_temporary_directory = temporary
     batch = new_batch(app_keys, now="2026-08-14T12:00:00Z")
@@ -2366,6 +2368,26 @@ class ReleaseTests(unittest.TestCase):
             call for call in operator.runner.calls if call.args[:2] == ("gh", "api") and "/check-runs" in call.args[2]
         ]
         self.assertEqual(len(check_calls), 1)
+
+    def test_observing_builds_uses_its_own_budget_not_the_full_timeout(self):
+        operator, batch = awaiting_approval_operator(codemagic_checks="timeout")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        operator.poll_policy = PollPolicy(
+            interval_seconds=2, timeout_seconds=300, observation_timeout_seconds=4
+        )
+
+        operator.release(batch["batch_id"])
+
+        self.assertEqual(operator.clock.sleeps, [2, 2])
+
+    def test_an_unobserved_build_is_reported_as_unobserved_not_absent(self):
+        operator, batch = awaiting_approval_operator(codemagic_checks="timeout")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.release(batch["batch_id"])
+
+        self.assertIn("observed", result["apps"]["pocket-manage"]["result"])
+        self.assertNotIn("started", result["apps"]["pocket-manage"]["result"])
 
     def test_codemagic_timeout_preserves_release_links(self):
         operator, batch = awaiting_approval_operator(codemagic_checks="timeout")

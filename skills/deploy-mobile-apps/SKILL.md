@@ -56,7 +56,7 @@ run still counts as detected. Do not wait for the builds to finish.
 | App skipped | Keep it in the summary with its recorded reason. Never merge it. |
 | `no releasable changes` | Show `unreleased_commits` and get the skip approved before `release`. |
 | `partial-release` | Name merged and remaining apps, then resume the same batch with `release` only after reporting the failure. |
-| No build started | Report `released-builds-unverified`, tag and commit URLs, and the missing checks. Resume observation with `status`. |
+| No build observed | Report `released-builds-unverified`, tag and commit URLs, and the unobserved checks. A queued build registers no check run, so this is not evidence that nothing is building. Resume observation with `status`. |
 | Preserved worktree | Report its path and leave it untouched. |
 
 Use `python scripts/mobile_release.py status --batch <batch-id> --json` for read-only
