@@ -22,6 +22,7 @@ npx skills update
 | --- | --- |
 | [deploy-mobile-apps](skills/deploy-mobile-apps/) | You need to prepare or release the managed Pocket Manage mobile apps with a saved approval boundary. |
 | [explain](skills/explain/) | You want something explained so you genuinely understand it — a file, class, module, subsystem, concept, commit range, branch diff, uncommitted work, or PR. Writes a self-contained HTML document with rendered Mermaid diagrams. |
+| [share-artifacts](skills/share-artifacts/) | An agent produces an HTML report, downloadable file, or local web preview to open on another device. Provides a verified Tailscale link and keeps the server available after handoff. |
 
 ## How this fits the rest of the setup
 
