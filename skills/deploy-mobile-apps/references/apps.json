@@ -6,6 +6,10 @@
     "Build IPA and Publish To AppStore Connect",
     "Build Web and Publish to Firebase Hosting"
   ],
+  "staging_checks": [
+    "Build IPA and Publish To TestFlight (Staging)",
+    "Build Android AppBundle and Publish to Internal Testing"
+  ],
   "apps": {
     "pocket-manage": {"display_name": "Pocket Manage", "repository": "MarketplaceSoftware/pocketmanage", "directory": "pocketmanage"},
     "installers": {"display_name": "Pocket Manage Installers", "repository": "MarketplaceSoftware/pocketmanage_installers", "directory": "pocketmanage_installers"},

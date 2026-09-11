@@ -56,6 +56,12 @@ def _parser() -> argparse.ArgumentParser:
 
     prepare = commands.add_parser("prepare", help="prepare a saved batch")
     prepare.add_argument("--batch", required=True)
+    prepare.add_argument(
+        "--staging-only",
+        action="store_true",
+        dest="staging_only",
+        help="stop once staging carries the prepared commit; do not promote to release",
+    )
     prepare.add_argument("--dry-run", action="store_true")
     prepare.add_argument("--json", action="store_true", dest="as_json")
 
@@ -75,7 +81,12 @@ def _next_command(batch: dict[str, Any]) -> str | None:
     if not batch_id:
         return None
     state = batch.get("state")
-    if state in {"preflight-complete", "prepare-failed", "prepare-in-progress"}:
+    if state in {
+        "preflight-complete",
+        "prepare-failed",
+        "prepare-in-progress",
+        "staging-complete",
+    }:
         return f"{COMMAND_PREFIX} prepare --batch {batch_id}"
     if state == "dry-run-complete":
         return f"{COMMAND_PREFIX} prepare --batch {batch_id}"
@@ -233,16 +244,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warnings.append("dry-run preflight was not saved")
                 next_command_override = f"{COMMAND_PREFIX} preflight --json"
         elif args.command == "prepare":
-            warnings.append(
-                "prepare pushes dev to staging, starting TestFlight internal dev-group "
-                "and Play internal-track builds before staging-to-release promotion"
-            )
+            if args.staging_only:
+                warnings.append(
+                    "staging-only: prepare pushes dev to staging, starting TestFlight "
+                    "internal dev-group and Play internal-track builds, and stops "
+                    "without promoting to release"
+                )
+            else:
+                warnings.append(
+                    "prepare pushes dev to staging, starting TestFlight internal dev-group "
+                    "and Play internal-track builds before staging-to-release promotion"
+                )
             if args.dry_run:
                 warnings.append(
                     "dry run only plans staging and promotion; staging CI, branch protection, "
                     "and webhooks must be ready before a real prepare"
                 )
-            batch = operator.prepare(args.batch, dry_run=args.dry_run)
+            batch = operator.prepare(
+                args.batch, dry_run=args.dry_run, staging_only=args.staging_only
+            )
         elif args.command == "release":
             if args.dry_run:
                 warnings.append(
