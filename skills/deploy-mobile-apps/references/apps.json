@@ -13,6 +13,7 @@
   },
   "defaults": {
     "dev_branch": "dev",
+    "staging_branch": "staging",
     "release_branch": "release",
     "submodule_path": "packages",
     "submodule_branch": "main",

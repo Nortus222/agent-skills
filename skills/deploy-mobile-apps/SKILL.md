@@ -19,14 +19,21 @@ python scripts/mobile_release.py preflight --json
 python scripts/mobile_release.py prepare --batch <batch-id> --json
 ```
 
+`prepare` bumps the submodule on `dev`, fast-forwards the existing `staging` branch
+to that commit, then promotes `staging` to `release`. The staging push starts
+CodeMagic builds publishing to the TestFlight internal dev group and Play internal
+track for each app. Land the staging CI changes and create protected staging
+branches with their webhooks before running a real `prepare`. A dry run only plans
+these steps; it does not verify those prerequisites or start builds.
+
 Promotion and release merges carry administrator privileges, because the `release`
 branch requires an approving review that the release account cannot give its own pull
 request. The matched head commit stays the only approval boundary.
 
 Stop when the state is `awaiting-approval`. Print one summary with these fields for
 every selected app: app, proposed version, Release Please PR number and URL, checks,
-head SHA, submodule SHA, and result or skip reason. Also print the batch ID, state,
-warnings, preserved worktree paths, and next command.
+head SHA, staging head SHA, submodule SHA, and result or skip reason. Also print the batch ID, state,
+branch flow `dev → staging → release`, warnings, preserved worktree paths, and next command.
 
 An app skipped for `no releasable changes` carries `unreleased_commits`: the commits
 this batch promoted that produced no version. List them under that app and ask the
@@ -57,6 +64,8 @@ run still counts as detected. Do not wait for the builds to finish.
 | `no releasable changes` | Show `unreleased_commits` and get the skip approved before `release`. |
 | `partial-release` | Name merged and remaining apps, then resume the same batch with `release` only after reporting the failure. |
 | No build observed | Report `released-builds-unverified`, tag and commit URLs, and the unobserved checks. A queued build registers no check run, so this is not evidence that nothing is building. Resume observation with `status`. |
+| Diverged `staging` | Report the saved failure and resume command. A human must investigate direct staging pushes before retrying; never merge or force-push staging. |
+| Missing `staging` | Report the missing prerequisite and saved resume command. Land staging CI and configure the branch, protection rules, and webhooks before retrying. |
 | Preserved worktree | Report its path and leave it untouched. |
 
 Use `python scripts/mobile_release.py status --batch <batch-id> --json` for read-only

@@ -75,7 +75,7 @@ def _next_command(batch: dict[str, Any]) -> str | None:
     if not batch_id:
         return None
     state = batch.get("state")
-    if state == "preflight-complete":
+    if state in {"preflight-complete", "prepare-failed", "prepare-in-progress"}:
         return f"{COMMAND_PREFIX} prepare --batch {batch_id}"
     if state == "dry-run-complete":
         return f"{COMMAND_PREFIX} prepare --batch {batch_id}"
@@ -172,6 +172,8 @@ def _print_human(
             f"pr={row.get('url') or row.get('pr_number') or '-'}",
             f"checks={_format_checks(row.get('checks'))}",
             f"head={row.get('head_sha') or '-'}",
+            f"staging={row.get('staging_sha') or '-'}",
+            f"branches={' → '.join(row.get('branches', [])) or '-'}",
             f"submodule={row.get('submodule_sha') or '-'}",
             f"result={row.get('result') or '-'}",
         ]
@@ -231,6 +233,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warnings.append("dry-run preflight was not saved")
                 next_command_override = f"{COMMAND_PREFIX} preflight --json"
         elif args.command == "prepare":
+            warnings.append(
+                "prepare pushes dev to staging, starting TestFlight internal dev-group "
+                "and Play internal-track builds before staging-to-release promotion"
+            )
+            if args.dry_run:
+                warnings.append(
+                    "dry run only plans staging and promotion; staging CI, branch protection, "
+                    "and webhooks must be ready before a real prepare"
+                )
             batch = operator.prepare(args.batch, dry_run=args.dry_run)
         elif args.command == "release":
             if args.dry_run:

@@ -106,6 +106,7 @@ class AppConfig:
     repository: str
     directory: str
     dev_branch: str
+    staging_branch: str
     release_branch: str
     submodule_path: str
     submodule_branch: str
@@ -264,6 +265,7 @@ class ReleaseOperator:
                     app_record,
                     dry_run=dry_run,
                 )
+                self._fast_forward_staging(batch, app, app_record, dry_run=dry_run)
                 self._promote_development(
                     batch,
                     app,
@@ -277,6 +279,7 @@ class ReleaseOperator:
                 batch["state"] = "prepare-failed"
                 if not dry_run:
                     self.store.save(batch)
+                error.recovery_batch = batch
                 raise
 
         batch["state"] = "dry-run-complete" if dry_run else "prepare-complete"
@@ -1054,7 +1057,7 @@ class ReleaseOperator:
         app_record.setdefault("submodule_before", app_record["packages_pointer_sha"])
         app_record.setdefault("submodule_after", app_record["packages_sha"])
         app_record.setdefault("dev_push", "pending")
-        app_record.setdefault("preparation_pr", app_record.get("dev_to_release_pr"))
+        app_record.setdefault("preparation_pr", app_record.get("staging_to_release_pr"))
         app_record.setdefault("release_sha", app_record["release_sha"])
         app_record.setdefault("release_sha_before", app_record["release_sha"])
         app_record.setdefault("status", "pending")
@@ -1095,8 +1098,8 @@ class ReleaseOperator:
             )
         if (
             pull_request.get("state") != "MERGED"
-            or pull_request.get("headRefName") != app.dev_branch
-            or pull_request.get("headRefOid") != app_record.get("dev_sha")
+            or pull_request.get("headRefName") != app.staging_branch
+            or pull_request.get("headRefOid") != app_record.get("staging_sha")
             or pull_request.get("baseRefName") != app.release_branch
         ):
             raise ReleaseError(
@@ -1245,6 +1248,72 @@ class ReleaseOperator:
             )
             app_record["worktree"] = None
 
+    def _fast_forward_staging(
+        self,
+        batch: dict[str, Any],
+        app: AppConfig,
+        app_record: dict[str, Any],
+        *,
+        dry_run: bool,
+    ) -> None:
+        """Advance an existing staging branch to the prepared dev commit without merging."""
+        repository_path = Path(app_record["repository_path"])
+        dev_ref = f"refs/remotes/origin/{app.dev_branch}"
+        staging_ref = f"refs/remotes/origin/{app.staging_branch}"
+        fetch = ["git", "fetch", "origin", _remote_tracking_refspec(app.dev_branch),
+                 _remote_tracking_refspec(app.staging_branch)]
+        ancestry_command = ["git", "merge-base", "--is-ancestor", staging_ref, dev_ref]
+        app_record["branches"] = [app.dev_branch, app.staging_branch, app.release_branch]
+        if dry_run:
+            # A planned bump has no commit SHA until prepare actually creates it.
+            planned_sha = (
+                "<prepared-dev-sha>" if app_record["dev_push"] == "planned"
+                else app_record["dev_sha"]
+            )
+            app_record["planned_staging_sha"] = planned_sha
+            app_record["staging_push"] = "planned"
+            app_record["planned_commands"].extend([
+                fetch, ancestry_command,
+                ["git", "push", "origin", f"{planned_sha}:refs/heads/{app.staging_branch}"],
+            ])
+            return
+
+        command = ["git", "ls-remote", "--exit-code", "origin",
+                   f"refs/heads/{app.staging_branch}"]
+        remote = self.runner.run(command, cwd=repository_path, mutates=False)
+        if remote.returncode == 2:
+            raise ReleaseError(
+                f"repository {app.repository}: missing prerequisite origin/{app.staging_branch}; "
+                "land staging CI, create the branch, and configure protection rules and webhooks first"
+            )
+        if remote.returncode != 0:
+            raise ReleaseError(self._command_error(app.repository, command, remote))
+        self._run(fetch, cwd=repository_path, repository=app.repository)
+        dev_sha = self._run(
+            ["git", "rev-parse", f"{dev_ref}^{{commit}}"],
+            cwd=repository_path, repository=app.repository,
+        ).stdout.strip()
+        if dev_sha != app_record["dev_sha"]:
+            raise ReleaseError(
+                f"repository {app.repository}: origin/{app.dev_branch} changed before staging push"
+            )
+        ancestry = self.runner.run(ancestry_command, cwd=repository_path, mutates=False)
+        if ancestry.returncode == 1:
+            raise ReleaseError(
+                f"repository {app.repository}: origin/{app.staging_branch} has diverged from "
+                f"origin/{app.dev_branch}; a human must investigate direct staging pushes "
+                "before resuming; staging will not be merged or force-pushed"
+            )
+        if ancestry.returncode != 0:
+            raise ReleaseError(self._command_error(app.repository, ancestry_command, ancestry))
+        self._run(
+            ["git", "push", "origin", f"{dev_sha}:refs/heads/{app.staging_branch}"],
+            cwd=repository_path, repository=app.repository, mutates=True,
+        )
+        app_record["staging_sha"] = dev_sha
+        app_record["staging_push"] = "pushed"
+        self.store.save(batch)
+
     def _promote_development(
         self,
         batch: dict[str, Any],
@@ -1254,34 +1323,44 @@ class ReleaseOperator:
         dry_run: bool,
     ) -> None:
         repository_path = Path(app_record["repository_path"])
-        dev_ref = f"refs/remotes/origin/{app.dev_branch}"
+        if dry_run:
+            app_record["planned_commands"].extend([
+                self._preparation_pr_create_command(app),
+                _guarded_merge_command(
+                    app.repository, "<preparation-pr-number>",
+                    app_record["planned_staging_sha"],
+                ),
+            ])
+            app_record["status"] = "planned"
+            return
+        staging_ref = f"refs/remotes/origin/{app.staging_branch}"
         release_ref = f"refs/remotes/origin/{app.release_branch}"
         self._run(
             [
                 "git",
                 "fetch",
                 "origin",
-                _remote_tracking_refspec(app.dev_branch),
+                _remote_tracking_refspec(app.staging_branch),
                 _remote_tracking_refspec(app.release_branch),
             ],
             cwd=repository_path,
             repository=app.repository,
         )
         branch_shas = self._run(
-            ["git", "rev-parse", f"{dev_ref}^{{commit}}", f"{release_ref}^{{commit}}"],
+            ["git", "rev-parse", f"{staging_ref}^{{commit}}", f"{release_ref}^{{commit}}"],
             cwd=repository_path,
             repository=app.repository,
         ).stdout.splitlines()
         if len(branch_shas) != 2 or not all(_is_sha(value) for value in branch_shas):
             raise ReleaseError(
-                f"repository {app.repository}: invalid fetched development or release branch"
+                f"repository {app.repository}: invalid fetched staging or release branch"
             )
-        dev_sha, release_sha = branch_shas
-        if dev_sha != app_record["dev_sha"]:
+        staging_sha, release_sha = branch_shas
+        if staging_sha != app_record["staging_sha"]:
             raise ReleaseError(
-                f"repository {app.repository}: origin/dev changed before promotion"
+                f"repository {app.repository}: origin/staging changed before promotion"
             )
-        ancestry_command = ["git", "merge-base", "--is-ancestor", dev_ref, release_ref]
+        ancestry_command = ["git", "merge-base", "--is-ancestor", staging_ref, release_ref]
         ancestry = self.runner.run(ancestry_command, cwd=repository_path, mutates=False)
         if ancestry.returncode not in {0, 1}:
             command = self._redact(shlex.join(ancestry_command))
@@ -1294,7 +1373,7 @@ class ReleaseOperator:
             app_record["status"] = "skipped"
             app_record["state"] = "prepare-complete"
             app_record["release_sha"] = release_sha
-            app_record["skip_reason"] = "no dev to release changes"
+            app_record["skip_reason"] = "no staging to release changes"
             return
 
         pull_requests = self._list_preparation_pull_requests(app)
@@ -1303,23 +1382,9 @@ class ReleaseOperator:
                 f"repository {app.repository}: duplicate preparation pull requests"
             )
 
-        if dry_run and not pull_requests:
-            create = self._preparation_pr_create_command(app)
-            app_record["planned_commands"].append(create)
-            number = "<preparation-pr-number>"
-            app_record["planned_commands"].append(
-                _guarded_merge_command(
-                    app.repository,
-                    number,
-                    dev_sha,
-                )
-            )
-            app_record["status"] = "planned"
-            return
-
         if pull_requests:
             pull_request = self._validate_exact_preparation_pr(
-                app, pull_requests[0], dev_sha
+                app, pull_requests[0], staging_sha
             )
             pull_request["status"] = "open"
         else:
@@ -1336,8 +1401,8 @@ class ReleaseOperator:
             pull_request = {
                 "number": int(match.group(1)),
                 "url": created,
-                "headRefName": app.dev_branch,
-                "headRefOid": dev_sha,
+                "headRefName": app.staging_branch,
+                "headRefOid": staging_sha,
                 "baseRefName": app.release_branch,
                 "status": "open",
             }
@@ -1422,7 +1487,7 @@ class ReleaseOperator:
         pull_request_state = self._await_known_mergeability(
             app, number, pull_request_state
         )
-        self._validate_exact_preparation_pr(app, pull_request_state, dev_sha)
+        self._validate_exact_preparation_pr(app, pull_request_state, staging_sha)
         if (
             pull_request_state.get("state") != "OPEN"
             or pull_request_state.get("mergeable") != "MERGEABLE"
@@ -1434,22 +1499,11 @@ class ReleaseOperator:
                 f"{pull_request_state.get('mergeStateStatus')})"
             )
 
-        if dry_run:
-            app_record["planned_commands"].append(
-                _guarded_merge_command(
-                    app.repository,
-                    number,
-                    dev_sha,
-                )
-            )
-            app_record["status"] = "planned"
-            return
-
         self._run(
             _guarded_merge_command(
                 app.repository,
                 number,
-                dev_sha,
+                staging_sha,
             ),
             repository=app.repository,
             mutates=True,
@@ -1511,7 +1565,7 @@ class ReleaseOperator:
                     "--base",
                     app.release_branch,
                     "--head",
-                    app.dev_branch,
+                    app.staging_branch,
                     "--json",
                     "number,url,headRefName,headRefOid,baseRefName",
                 ],
@@ -1537,11 +1591,11 @@ class ReleaseOperator:
             "--base",
             app.release_branch,
             "--head",
-            app.dev_branch,
+            app.staging_branch,
             "--title",
-            "chore: promote dev to release",
+            "chore: promote staging to release",
             "--body",
-            "Promote the prepared development branch to release.",
+            "Promote the prepared staging branch to release.",
         ]
 
     @staticmethod
@@ -1553,7 +1607,7 @@ class ReleaseOperator:
         if (
             not isinstance(pull_request.get("number"), int)
             or not isinstance(pull_request.get("url"), str)
-            or pull_request.get("headRefName") != app.dev_branch
+            or pull_request.get("headRefName") != app.staging_branch
             or pull_request.get("headRefOid") != expected_head_sha
             or pull_request.get("baseRefName") != app.release_branch
         ):
@@ -1752,7 +1806,7 @@ class ReleaseOperator:
                     "--base",
                     app.release_branch,
                     "--head",
-                    app.dev_branch,
+                    app.staging_branch,
                     "--json",
                     "number,url,headRefName,baseRefName",
                 ],
@@ -1765,18 +1819,19 @@ class ReleaseOperator:
             raise ReleaseError(f"repository {app.repository}: invalid pull request response")
         if len(pull_requests) > 1:
             raise ReleaseError(
-                f"repository {app.repository}: duplicate dev to release pull requests"
+                f"repository {app.repository}: duplicate staging to release pull requests"
             )
 
         return {
             "state": "preflight-complete",
             "repository": app.repository,
             "repository_path": str(repository_path),
+            "branches": [app.dev_branch, app.staging_branch, app.release_branch],
             "dev_sha": dev_sha,
             "release_sha": release_sha,
             "packages_pointer_sha": match.group(1),
             "packages_sha": packages_sha,
-            "dev_to_release_pr": pull_requests[0] if pull_requests else None,
+            "staging_to_release_pr": pull_requests[0] if pull_requests else None,
         }
 
     def _promoted_commit_subjects(
@@ -1967,6 +2022,8 @@ def approval_rows(batch: dict[str, Any]) -> list[dict[str, Any]]:
                 "base": app.get("release_pr_base"),
                 "labels": app.get("release_pr_labels", []),
                 "head_sha": app.get("release_pr_head_sha"),
+                "staging_sha": app.get("staging_sha"),
+                "branches": app.get("branches", []),
                 "submodule_sha": app.get("submodule_sha", app.get("packages_sha")),
                 "result": app.get("result", app.get("skip_reason")),
                 "unreleased_commits": app.get("unreleased_commits", []),
