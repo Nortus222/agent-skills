@@ -26,6 +26,18 @@ track for each app. Land the staging CI changes and create protected staging
 branches with their webhooks before running a real `prepare`. A dry run only plans
 these steps; it does not verify those prerequisites or start builds.
 
+Add `--staging-only` to stop once staging carries the prepared commit, so a
+TestFlight build proves the change before any of it reaches `release`:
+
+```bash
+python scripts/mobile_release.py prepare --batch <batch-id> --staging-only --json
+```
+
+That rests at `staging-complete` and reports the staging builds. Resume the same
+batch with a plain `prepare` to promote it; the submodule bump is not repeated.
+Prefer `--staging-only` whenever the batch carries a change no store build has
+exercised yet.
+
 Promotion and release merges carry administrator privileges, because the `release`
 branch requires an approving review that the release account cannot give its own pull
 request. The matched head commit stays the only approval boundary.
@@ -58,6 +70,9 @@ run still counts as detected. Do not wait for the builds to finish.
 
 | State or event | Response |
 | --- | --- |
+| `staging-complete` | Report each staging check and any diagnosis, then pause for the human to judge the TestFlight build. |
+| Staging build failed | Name the failing step and its log tail from `staging_diagnosis`. Fix the cause and stage again; never promote a red staging build. |
+| Staging check absent | Read `staging_diagnosis.missing`. A build cancelled before it starts registers no check run, so an absent check is not evidence of a broken trigger. |
 | `awaiting-approval` | Show the complete batch summary and pause. |
 | Approval snapshot changed | Refuse the changed Release Please head, show the refreshed summary, and request new confirmation. |
 | App skipped | Keep it in the summary with its recorded reason. Never merge it. |
@@ -67,6 +82,16 @@ run still counts as detected. Do not wait for the builds to finish.
 | Diverged `staging` | Report the saved failure and resume command. A human must investigate direct staging pushes before retrying; never merge or force-push staging. |
 | Missing `staging` | Report the missing prerequisite and saved resume command. Land staging CI and configure the branch, protection rules, and webhooks before retrying. |
 | Preserved worktree | Report its path and leave it untouched. |
+
+## CodeMagic diagnostics
+
+A failed or absent build is diagnosed through the CodeMagic API: the failing step's
+name and the tail of its log, and the builds on the branch when no check run appeared.
+The token comes from `CODEMAGIC_API_TOKEN`, else the login keychain entry of the same
+name. Without a token the skill still reports every check name and state, and records
+that the diagnosis is unavailable.
+
+## Recovery
 
 Use `python scripts/mobile_release.py status --batch <batch-id> --json` for read-only
 recovery and observation. On any command failure, report completed actions, the saved

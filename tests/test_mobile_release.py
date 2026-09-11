@@ -63,7 +63,7 @@ class CliTests(unittest.TestCase):
                     ["prepare", "--batch", "batch-1", "--dry-run", "--json"]
                 )
             factory.return_value.prepare.assert_called_once_with(
-                "batch-1", dry_run=True
+                "batch-1", dry_run=True, staging_only=False
             )
 
     def test_preflight_json_defaults_to_all_configured_apps(self):
@@ -1118,6 +1118,23 @@ def prepared_operator(
     return operator, batch
 
 
+CODEMAGIC_YAML = "\n".join(
+    [
+        "workflows:",
+        "  android:",
+        "    name: Build Android AppBundle and Publish",
+        "  ios:",
+        "    name: Build IPA and Publish To AppStore Connect",
+        "  web:",
+        "    name: Build Web and Publish to Firebase Hosting",
+        "  ios-staging:",
+        "    name: Build IPA and Publish To TestFlight (Staging)",
+        "  android-staging:",
+        "    name: Build Android AppBundle and Publish to Internal Testing",
+    ]
+)
+
+
 def successful_preflight_responses(app_count=3):
     responses = [CommandResult(0, "github.com\n", "")]
     repositories = (
@@ -1141,21 +1158,10 @@ def successful_preflight_responses(app_count=3):
                 CommandResult(0, "", ""),
                 CommandResult(0, f"{'f' * 40}\n", ""),
                 CommandResult(0, "{}\n{}\n", ""),
-                CommandResult(
-                    0,
-                    "\n".join(
-                        [
-                            "workflows:",
-                            "  android:",
-                            "    name: Build Android AppBundle and Publish",
-                            "  ios:",
-                            "    name: Build IPA and Publish To AppStore Connect",
-                            "  web:",
-                            "    name: Build Web and Publish to Firebase Hosting",
-                        ]
-                    ),
-                    "",
-                ),
+                CommandResult(0, CODEMAGIC_YAML, ""),
+                # Preflight reads codemagic.yaml twice: release for the release
+                # workflows, dev for the staging ones.
+                CommandResult(0, CODEMAGIC_YAML, ""),
                 CommandResult(0, "[]\n", ""),
                 CommandResult(0, "", ""),
             ]
@@ -1268,7 +1274,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_a_repository_that_does_not_ignore_the_deployment_worktree(self):
         responses = successful_preflight_responses(app_count=1)
-        responses[15] = CommandResult(1, "", "")
+        responses[16] = CommandResult(1, "", "")
         operator = make_operator(responses)
         self.addCleanup(operator._test_temporary_directory.cleanup)
 
@@ -1349,7 +1355,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_duplicate_dev_to_release_prs(self):
         responses = successful_preflight_responses(app_count=1)
-        responses[14] = CommandResult(
+        responses[15] = CommandResult(
             0,
             json.dumps(
                 [

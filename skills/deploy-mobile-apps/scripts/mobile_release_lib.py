@@ -28,7 +28,11 @@ _CONVENTIONAL_SUBJECT = re.compile(
     r"(?P<type>feat|fix)(?:\([^)]*\))?!?:\s*(?P<summary>.+)"
 )
 
+import codemagic
+
 PACKAGES_REPOSITORY = "MarketplaceSoftware/packages"
+_LOG_TAIL_LINES = 15
+_FAILING_CONCLUSIONS = {"failure", "cancelled", "timed_out"}
 
 
 class ReleaseError(RuntimeError):
@@ -119,6 +123,7 @@ class Inventory:
     workspace_root_env: str
     default_workspace_root: str
     codemagic_checks: tuple[str, ...]
+    staging_checks: tuple[str, ...]
     apps: dict[str, AppConfig]
 
 
@@ -172,6 +177,7 @@ def load_inventory(path: Path) -> Inventory:
         workspace_root_env=data["workspace_root_env"],
         default_workspace_root=data["default_workspace_root"],
         codemagic_checks=tuple(data["codemagic_checks"]),
+        staging_checks=tuple(data["staging_checks"]),
         apps=apps,
     )
 
@@ -240,14 +246,27 @@ class ReleaseOperator:
             self.store.save(batch)
         return batch
 
-    def prepare(self, batch_id: str, dry_run: bool = False) -> dict[str, Any]:
-        """Update development pointers and merge each exact promotion PR."""
+    def prepare(
+        self,
+        batch_id: str,
+        dry_run: bool = False,
+        staging_only: bool = False,
+    ) -> dict[str, Any]:
+        """Update development pointers and merge each exact promotion PR.
+
+        With [staging_only] the batch stops once staging carries the prepared
+        commit, so a TestFlight build can be proven before anything reaches the
+        release branch. Resuming the same batch with a plain prepare promotes
+        it; the bump is not repeated, because the completed preparation is
+        still current.
+        """
         batch = self.store.load(batch_id)
         if batch.get("state") not in {
             "preflight-complete",
             "prepare-in-progress",
             "prepare-failed",
             "prepare-complete",
+            "staging-complete",
         }:
             raise ReleaseError(f"batch {batch_id}: prepare is not allowed from its current state")
 
@@ -266,6 +285,10 @@ class ReleaseOperator:
                     dry_run=dry_run,
                 )
                 self._fast_forward_staging(batch, app, app_record, dry_run=dry_run)
+                if staging_only:
+                    if not dry_run:
+                        self._verify_staging(batch, app, app_record)
+                    continue
                 self._promote_development(
                     batch,
                     app,
@@ -282,11 +305,16 @@ class ReleaseOperator:
                 error.recovery_batch = batch
                 raise
 
-        batch["state"] = "dry-run-complete" if dry_run else "prepare-complete"
-        if not dry_run:
+        if dry_run:
+            batch["state"] = "dry-run-complete"
+            return batch
+        if staging_only:
+            batch["state"] = "staging-complete"
             self.store.save(batch)
-            return self.discover_versions(batch)
-        return batch
+            return batch
+        batch["state"] = "prepare-complete"
+        self.store.save(batch)
+        return self.discover_versions(batch)
 
     def discover_versions(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Snapshot Release Please proposals for one human approval decision."""
@@ -780,6 +808,146 @@ class ReleaseOperator:
         )
         return True
 
+    def _verify_staging(
+        self,
+        batch: dict[str, Any],
+        app: AppConfig,
+        app_record: dict[str, Any],
+    ) -> bool:
+        """Observe the staging builds the fast-forward push started."""
+        staging_sha = app_record.get("staging_sha")
+        if not staging_sha:
+            return False
+        checks, missing = self._wait_for_codemagic_checks(
+            app, staging_sha, self.inventory.staging_checks
+        )
+        failed = sorted(
+            name
+            for name, check in checks.items()
+            if check.get("conclusion") in _FAILING_CONCLUSIONS
+        )
+        app_record.update(
+            {
+                "staging_checks": checks,
+                "staging_missing_checks": missing,
+                "staging_failed_checks": failed,
+                "staging_diagnosis": self._diagnose_staging(
+                    app, staging_sha, checks, missing
+                ),
+                "state": "staging-complete",
+                "status": "staged",
+                "error": None,
+                "result": _staging_result(checks, missing, failed),
+            }
+        )
+        self.store.save(batch)
+        return bool(checks) and not missing and not failed
+
+    def _diagnose_staging(
+        self,
+        app: AppConfig,
+        staging_sha: str,
+        checks: dict[str, dict[str, Any]],
+        missing: Sequence[str],
+    ) -> dict[str, Any]:
+        """Explain each failed or absent staging build, as far as CodeMagic will say."""
+        client = self._codemagic_client()
+        if client is None:
+            return {
+                "unavailable": (
+                    "no CodeMagic API token; set CODEMAGIC_API_TOKEN or store it in the "
+                    "login keychain as CODEMAGIC_API_TOKEN to see why a build failed"
+                )
+            }
+
+        diagnosis: dict[str, Any] = {}
+        for name, check in checks.items():
+            if check.get("conclusion") not in _FAILING_CONCLUSIONS:
+                continue
+            reference = codemagic.build_reference(check.get("details_url"))
+            if reference is None:
+                continue
+            try:
+                build = client.build(reference.build_id)
+                steps = codemagic.failed_steps(build)
+                entry: dict[str, Any] = {
+                    "build_status": build.get("status"),
+                    "version": build.get("version"),
+                    "failed_steps": [step.get("name") for step in steps],
+                }
+                if steps and steps[-1].get("_id"):
+                    entry["log_tail"] = _log_tail(
+                        client.step_log(reference.build_id, steps[-1]["_id"])
+                    )
+                diagnosis[name] = entry
+            except codemagic.CodemagicError as error:
+                diagnosis[name] = {"error": str(error)}
+
+        if missing:
+            diagnosis["missing"] = self._explain_missing_builds(
+                client, app, staging_sha, checks, list(missing)
+            )
+        return diagnosis
+
+    def _explain_missing_builds(
+        self,
+        client: "codemagic.CodemagicClient",
+        app: AppConfig,
+        staging_sha: str,
+        checks: dict[str, dict[str, Any]],
+        missing: list[str],
+    ) -> dict[str, Any]:
+        """Separate a workflow that never ran from one that ran and left no check run.
+
+        A build cancelled before it starts registers no GitHub check run at all, so
+        an absent check is not evidence that the trigger is misconfigured.
+        """
+        app_id = self._codemagic_app_id(client, app, checks)
+        if app_id is None:
+            return {"workflows": missing, "note": "no CodeMagic application matched"}
+        try:
+            builds = client.builds_for_branch(app_id, app.staging_branch)
+        except codemagic.CodemagicError as error:
+            return {"workflows": missing, "error": str(error)}
+        for_commit = [
+            {"id": build.get("_id"), "status": build.get("status")}
+            for build in builds
+            if (build.get("commit") or {}).get("hash") == staging_sha
+            or build.get("commit") is None
+        ]
+        return {
+            "workflows": missing,
+            "builds_on_branch": for_commit[:5],
+            "note": (
+                "builds exist but registered no check run; a build cancelled before it "
+                "starts never reports one"
+                if for_commit
+                else "no CodeMagic build exists for this branch; check the push trigger"
+            ),
+        }
+
+    def _codemagic_app_id(
+        self,
+        client: "codemagic.CodemagicClient",
+        app: AppConfig,
+        checks: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """The CodeMagic application id, from an observed check run if one exists."""
+        for check in checks.values():
+            reference = codemagic.build_reference(check.get("details_url"))
+            if reference is not None:
+                return reference.app_id
+        return None
+
+    def _codemagic_client(self) -> "codemagic.CodemagicClient | None":
+        """The diagnostics client, or None when no token is configured."""
+        if not hasattr(self, "_codemagic_cached"):
+            token = codemagic.resolve_token(dict(self.environ))
+            self._codemagic_cached = (
+                codemagic.CodemagicClient(token) if token else None
+            )
+        return self._codemagic_cached
+
     def _resolve_tag_commit(self, app: AppConfig, tag: str) -> str:
         command = ["gh", "api", f"repos/{app.repository}/git/ref/tags/{tag}"]
         deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
@@ -833,7 +1001,10 @@ class ReleaseOperator:
         return commit_sha
 
     def _wait_for_codemagic_checks(
-        self, app: AppConfig, commit_sha: str
+        self,
+        app: AppConfig,
+        commit_sha: str,
+        expected_names: Sequence[str] | None = None,
     ) -> tuple[dict[str, dict[str, Any]], list[str]]:
         deadline = (
             self.clock.monotonic() + self.poll_policy.observation_timeout_seconds
@@ -843,7 +1014,10 @@ class ReleaseOperator:
             "api",
             f"repos/{app.repository}/commits/{commit_sha}/check-runs",
         ]
-        expected = set(self.inventory.codemagic_checks)
+        wanted = list(
+            self.inventory.codemagic_checks if expected_names is None else expected_names
+        )
+        expected = set(wanted)
         observed: dict[str, dict[str, Any]] = {}
         while True:
             response = self._load_json(
@@ -889,9 +1063,7 @@ class ReleaseOperator:
                     "details_url": details_url,
                 }
             observed.update(found)
-            missing = [
-                name for name in self.inventory.codemagic_checks if name not in observed
-            ]
+            missing = [name for name in wanted if name not in observed]
             # A started build proves CodeMagic reacted to the tag. The rest register
             # minutes later, and a release should not be held open watching for them.
             if observed:
@@ -1779,18 +1951,35 @@ class ReleaseOperator:
             cwd=repository_path,
             repository=app.repository,
         )
-        codemagic = self._run(
+        release_codemagic = self._run(
             ["git", "show", f"{release_sha}:codemagic.yaml"],
             cwd=repository_path,
             repository=app.repository,
         ).stdout
-        workflow_names = _codemagic_workflow_names(codemagic)
+        workflow_names = _codemagic_workflow_names(release_codemagic)
         missing_workflows = [
             name for name in self.inventory.codemagic_checks if name not in workflow_names
         ]
         if missing_workflows:
             raise ReleaseError(
                 f"repository {app.repository}: missing workflow names: {', '.join(missing_workflows)}"
+            )
+
+        # Staging workflows are validated against dev, not release: they reach the
+        # release branch only once a promotion carries them there.
+        dev_codemagic = self._run(
+            ["git", "show", f"{dev_sha}:codemagic.yaml"],
+            cwd=repository_path,
+            repository=app.repository,
+        ).stdout
+        dev_workflow_names = _codemagic_workflow_names(dev_codemagic)
+        missing_staging = [
+            name for name in self.inventory.staging_checks if name not in dev_workflow_names
+        ]
+        if missing_staging:
+            raise ReleaseError(
+                f"repository {app.repository}: missing staging workflow names on "
+                f"{app.dev_branch}: {', '.join(missing_staging)}"
             )
 
         pull_requests = self._load_json(
@@ -2030,6 +2219,26 @@ def approval_rows(batch: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _log_tail(log: str) -> list[str]:
+    """The last few non-blank log lines, which is where the reason lives."""
+    lines = [line.rstrip() for line in log.splitlines() if line.strip()]
+    return lines[-_LOG_TAIL_LINES:]
+
+
+def _staging_result(
+    checks: dict[str, dict[str, Any]],
+    missing: Sequence[str],
+    failed: Sequence[str],
+) -> str:
+    if not checks:
+        return "staged; no CodeMagic build observed yet"
+    if failed:
+        return f"staged; CodeMagic builds failed: {', '.join(failed)}"
+    if missing:
+        return f"staged; builds started, not yet reported: {', '.join(missing)}"
+    return "staged; CodeMagic staging builds passed"
 
 
 def _normalize_repository(value: str) -> str:
