@@ -353,11 +353,31 @@ class PreparationRunner:
         self.remote_dev = remote_dev or "d" * 40
         self.remote_release = remote_release or "e" * 40
         self.resumed = resumed
+        self.staging_failure = None
+        self.remote_staging = self.remote_dev
 
     def run(self, args, *, cwd=None, mutates=False):
         self.calls.append(RecordedCall(tuple(args), cwd, mutates))
         command = tuple(args)
 
+        if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/staging"):
+            if self.staging_failure == "missing":
+                return CommandResult(2, "", "")
+            return CommandResult(0, f"{self.remote_staging}\trefs/heads/staging\n", "")
+        if command == ("git", "fetch", "origin",
+                       "+refs/heads/dev:refs/remotes/origin/dev",
+                       "+refs/heads/staging:refs/remotes/origin/staging"):
+            return CommandResult(0, "", "")
+        if command == ("git", "rev-parse", "refs/remotes/origin/dev^{commit}"):
+            return CommandResult(0, self.remote_dev + "\n", "")
+        if command == ("git", "merge-base", "--is-ancestor",
+                       "refs/remotes/origin/staging", "refs/remotes/origin/dev"):
+            return CommandResult(1 if self.staging_failure == "diverged" else 0, "", "")
+        if command[:3] == ("git", "push", "origin") and command[-1].endswith(":refs/heads/staging"):
+            if self.staging_failure == "push-rejected":
+                return CommandResult(1, "", "non-fast-forward")
+            self.remote_staging = command[-1].split(":")[0]
+            return CommandResult(0, "", "")
         if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/dev"):
             return CommandResult(0, f"{self.remote_dev}\trefs/heads/dev\n", "")
         if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/release"):
@@ -366,7 +386,7 @@ class PreparationRunner:
             "git",
             "fetch",
             "origin",
-            "+refs/heads/dev:refs/remotes/origin/dev",
+            "+refs/heads/staging:refs/remotes/origin/staging",
             "+refs/heads/release:refs/remotes/origin/release",
         ):
             self.promotion_refs_fetched = True
@@ -374,7 +394,7 @@ class PreparationRunner:
         if command == (
             "git",
             "rev-parse",
-            "refs/remotes/origin/dev^{commit}",
+            "refs/remotes/origin/staging^{commit}",
             "refs/remotes/origin/release^{commit}",
         ):
             return CommandResult(0, f"{self.remote_dev}\n{self.remote_release}\n", "")
@@ -459,7 +479,7 @@ class PreparationRunner:
                     {
                         "number": 17,
                         "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/17",
-                        "headRefName": "dev",
+                        "headRefName": "staging",
                         "headRefOid": self.remote_dev,
                         "baseRefName": "release",
                     }
@@ -469,7 +489,7 @@ class PreparationRunner:
                     {
                         "number": 18,
                         "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/18",
-                        "headRefName": "dev",
+                        "headRefName": "staging",
                         "headRefOid": self.remote_dev,
                         "baseRefName": "release",
                     }
@@ -533,7 +553,7 @@ class PreparationRunner:
                         "mergedAt": "2026-08-14T13:00:00Z" if self.resumed else None,
                         "mergeable": mergeable,
                         "mergeStateStatus": "DIRTY" if self.merge_conflict else "CLEAN",
-                        "headRefName": "dev",
+                        "headRefName": "staging",
                         "headRefOid": self.remote_dev,
                         "baseRefName": "release",
                     }
@@ -1073,13 +1093,14 @@ def prepared_operator(
         "release_sha": release_sha,
         "packages_pointer_sha": "c" * 40 if submodule_changed else "f" * 40,
         "packages_sha": "f" * 40,
-        "dev_to_release_pr": None,
+        "staging_to_release_pr": None,
     }
     if resumed:
         batch["state"] = "prepare-failed"
         batch["apps"][app_key].update(
             {
                 "dev_sha": remote_dev,
+                "staging_sha": remote_dev,
                 "worktree": None,
                 "submodule_before": "c" * 40,
                 "submodule_after": "f" * 40,
@@ -1174,6 +1195,7 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(set(inventory.apps), {"pocket-manage", "installers", "partner"})
         for app in inventory.apps.values():
             self.assertEqual(app.dev_branch, "dev")
+            self.assertEqual(app.staging_branch, "staging")
             self.assertEqual(app.release_branch, "release")
             self.assertEqual(app.submodule_path, "packages")
             self.assertEqual(app.submodule_branch, "main")
@@ -1340,7 +1362,7 @@ class PreflightTests(unittest.TestCase):
         operator = make_operator(responses)
         self.addCleanup(operator._test_temporary_directory.cleanup)
 
-        with self.assertRaisesRegex(ReleaseError, "duplicate dev to release pull requests"):
+        with self.assertRaisesRegex(ReleaseError, "duplicate staging to release pull requests"):
             operator.preflight(["pocket-manage"])
 
         self.assertEqual(list(operator.store.root.glob("*.json")), [])
@@ -1442,6 +1464,87 @@ class PreflightTests(unittest.TestCase):
 
 
 class PrepareTests(unittest.TestCase):
+    def test_staging_failures_save_state_and_print_resume_without_promotion(self):
+        for failure, reason in [("missing", "missing prerequisite origin/staging"),
+                                ("diverged", "origin/staging has diverged"),
+                                ("push-rejected", "non-fast-forward")]:
+            with self.subTest(failure=failure):
+                operator, batch = prepared_operator(submodule_changed=False)
+                self.addCleanup(operator._test_temporary_directory.cleanup)
+                operator.runner.staging_failure = failure
+                output = io.StringIO()
+                with mock.patch.object(mobile_release, "build_operator", return_value=operator):
+                    with mock.patch("sys.stdout", output):
+                        code = mobile_release.main([
+                            "prepare", "--batch", batch["batch_id"], "--json",
+                        ])
+                self.assertEqual(code, 1)
+                response = json.loads(output.getvalue())
+                self.assertIn(reason, response["error"])
+                saved = operator.store.load(batch["batch_id"])
+                self.assertEqual(saved["state"], "prepare-failed")
+                self.assertIn(reason, saved["apps"]["pocket-manage"]["error"])
+                self.assertEqual(response["recovery"]["next_command"],
+                                 f"python scripts/mobile_release.py prepare --batch {batch['batch_id']}")
+                self.assertFalse(any(c.args[:2] == ("gh", "pr") for c in operator.runner.calls))
+                if failure != "push-rejected":
+                    self.assertFalse(any(c.mutates for c in operator.runner.calls))
+
+    def test_staging_push_uses_prepared_commit_and_precedes_promotion(self):
+        operator, batch = prepared_operator(submodule_changed=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        result = operator.prepare(batch["batch_id"])
+        calls = command_args(operator.runner.calls)
+        ancestry = ["git", "merge-base", "--is-ancestor",
+                    "refs/remotes/origin/staging", "refs/remotes/origin/dev"]
+        push = ["git", "push", "origin", "1" * 40 + ":refs/heads/staging"]
+        create = next(c for c in calls if c[:3] == ["gh", "pr", "create"])
+        self.assertLess(calls.index(["git", "push", "origin", "HEAD:dev"]), calls.index(ancestry))
+        self.assertLess(calls.index(ancestry), calls.index(push))
+        self.assertLess(calls.index(push), calls.index(create))
+        self.assertEqual(create[create.index("--head") + 1], "staging")
+        self.assertEqual(create[create.index("--base") + 1], "release")
+        self.assertEqual(approval_rows(result)[0]["staging_sha"], "1" * 40)
+        self.assertTrue(any(
+            snapshot["apps"]["pocket-manage"].get("staging_sha") == "1" * 40
+            and snapshot["apps"]["pocket-manage"].get("preparation_pr") is None
+            for snapshot in operator.store.snapshots
+        ))
+
+    def test_staging_failure_resumes_same_batch_after_human_repair(self):
+        operator, batch = prepared_operator(submodule_changed=False)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        operator.runner.staging_failure = "diverged"
+        with self.assertRaises(ReleaseError):
+            operator.prepare(batch["batch_id"])
+        operator.runner.staging_failure = None
+        result = operator.prepare(batch["batch_id"])
+        self.assertEqual(result["state"], "awaiting-approval")
+        self.assertIsNone(result["apps"]["pocket-manage"]["error"])
+
+    def test_dry_run_plans_staging_for_each_configured_app_without_mutations(self):
+        operator, batch = prepared_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        record = batch["apps"]["pocket-manage"]
+        batch["selected_apps"] = list(operator.inventory.apps)
+        batch["apps"] = {}
+        for key, app in operator.inventory.apps.items():
+            batch["apps"][key] = dict(record, repository=app.repository)
+        operator.store.save(batch)
+        result = operator.prepare(batch["batch_id"], dry_run=True)
+        for app in result["apps"].values():
+            commands = app["planned_commands"]
+            self.assertIn(["git", "merge-base", "--is-ancestor",
+                           "refs/remotes/origin/staging", "refs/remotes/origin/dev"], commands)
+            self.assertIn(["git", "push", "origin",
+                           "<prepared-dev-sha>:refs/heads/staging"], commands)
+            create = next(c for c in commands if c[:3] == ["gh", "pr", "create"])
+            self.assertEqual(create[create.index("--head") + 1], "staging")
+            self.assertEqual(create[create.index("--base") + 1], "release")
+        self.assertFalse(any(c.mutates for c in operator.runner.calls))
+        self.assertEqual(operator.store.load(batch["batch_id"]), batch)
+
+
     def test_prepare_dry_run_and_execution_use_the_same_guarded_merge_command(self):
         dry_operator, dry_batch = prepared_operator(
             existing_pr=True,
@@ -1469,7 +1572,10 @@ class PrepareTests(unittest.TestCase):
                 if call.args[:3] == ("gh", "pr", "merge")
             )
         )
-        self.assertEqual(planned, executed)
+        self.assertEqual(planned[planned.index("--match-head-commit") + 1],
+                         executed[executed.index("--match-head-commit") + 1])
+        self.assertIn("--admin", planned)
+        self.assertIn("--admin", executed)
 
     def test_prepare_stops_when_dev_changes_at_the_atomic_merge_guard(self):
         operator, batch = prepared_operator(
@@ -1519,7 +1625,7 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(result["apps"]["partner"]["status"], "skipped")
         self.assertEqual(
             result["apps"]["partner"]["skip_reason"],
-            "no dev to release changes",
+            "no staging to release changes",
         )
 
     def test_prepare_skips_when_release_contains_a_different_dev_tip(self):
@@ -1534,7 +1640,7 @@ class PrepareTests(unittest.TestCase):
         app = result["apps"]["pocket-manage"]
         self.assertNotEqual(operator.runner.remote_dev, operator.runner.remote_release)
         self.assertEqual(app["status"], "skipped")
-        self.assertEqual(app["skip_reason"], "no dev to release changes")
+        self.assertEqual(app["skip_reason"], "no staging to release changes")
         self.assertFalse(
             any(call.args[:3] == ("gh", "pr", "list") for call in operator.runner.calls)
         )
@@ -1556,14 +1662,15 @@ class PrepareTests(unittest.TestCase):
             "git",
             "fetch",
             "origin",
-            "+refs/heads/dev:refs/remotes/origin/dev",
+            "+refs/heads/staging:refs/remotes/origin/staging",
             "+refs/heads/release:refs/remotes/origin/release",
         ]
         fetch_index = calls.index(fetch)
         ancestry_index = next(
             index
             for index, command in enumerate(calls)
-            if command[:3] == ["git", "merge-base", "--is-ancestor"]
+            if command == ["git", "merge-base", "--is-ancestor",
+                           "refs/remotes/origin/staging", "refs/remotes/origin/release"]
         )
         self.assertLess(fetch_index, ancestry_index)
         self.assertEqual(result["apps"]["pocket-manage"]["status"], "skipped")
@@ -1803,17 +1910,17 @@ class PrepareTests(unittest.TestCase):
         self.assertIn(["git", "push", "origin", "HEAD:dev"], planned)
         self.assertTrue(any(command[:3] == ["gh", "pr", "create"] for command in planned))
 
-    def test_prepare_dry_run_observes_existing_pr_mergeability(self):
-        operator, batch = prepared_operator(
-            existing_pr=True,
-            merge_conflict=True,
-        )
+    def test_prepare_dry_run_plans_future_head_without_checking_current_pr(self):
+        operator, batch = prepared_operator(existing_pr=True, merge_conflict=True)
         self.addCleanup(operator._test_temporary_directory.cleanup)
 
-        with self.assertRaisesRegex(ReleaseError, "preparation pull request is not mergeable"):
-            operator.prepare(batch["batch_id"], dry_run=True)
+        result = operator.prepare(batch["batch_id"], dry_run=True)
 
+        self.assertEqual(result["state"], "dry-run-complete")
+        app = result["apps"]["pocket-manage"]
+        self.assertEqual(app["planned_staging_sha"], "<prepared-dev-sha>")
         self.assertFalse(any(call.mutates for call in operator.runner.calls))
+        self.assertEqual(operator.store.load(batch["batch_id"]), batch)
 
     def test_prepare_saves_after_each_successful_remote_mutation(self):
         operator, batch = prepared_operator(submodule_changed=True)
@@ -1931,6 +2038,8 @@ class DiscoveryTests(unittest.TestCase):
                     "base": "release",
                     "labels": ["autorelease: pending"],
                     "head_sha": "a" * 40,
+                    "staging_sha": None,
+                    "branches": [],
                     "submodule_sha": "f" * 40,
                     "result": "ready for approval",
                     "unreleased_commits": [],
