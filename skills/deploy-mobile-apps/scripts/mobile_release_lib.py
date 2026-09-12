@@ -33,6 +33,11 @@ import codemagic
 PACKAGES_REPOSITORY = "MarketplaceSoftware/packages"
 _LOG_TAIL_LINES = 15
 _FAILING_CONCLUSIONS = {"failure", "cancelled", "timed_out"}
+_NO_BUILD_NOTE = (
+    "no CodeMagic build exists for this branch. A codemagic.yaml that fails "
+    "Codemagic's validation starts nothing at all and reports no failure, so read "
+    "the configuration before suspecting the push trigger."
+)
 
 
 class ReleaseError(RuntimeError):
@@ -925,7 +930,7 @@ class ReleaseOperator:
                 "builds exist but registered no check run; a build cancelled before it "
                 "starts never reports one"
                 if for_commit
-                else "no CodeMagic build exists for this branch; check the push trigger"
+                else _NO_BUILD_NOTE
             ),
         }
 
@@ -1859,6 +1864,18 @@ class ReleaseOperator:
             discovered[app_key] = paths[0]
         return discovered
 
+    def _reject_unusable_codemagic(
+        self, app: AppConfig, branch: str, content: str
+    ) -> None:
+        """Refuse a configuration Codemagic would reject at validation."""
+        unusable = _unusable_codemagic_values(content)
+        if unusable:
+            raise ReleaseError(
+                f"repository {app.repository}: codemagic.yaml on {branch} has values "
+                f"Codemagic rejects at validation: {', '.join(unusable)}; a rejected "
+                "configuration starts no build and reports no failure"
+            )
+
     def _release_is_contained_in_dev(
         self, app: AppConfig, repository_path: Path
     ) -> bool:
@@ -1981,6 +1998,7 @@ class ReleaseOperator:
             cwd=repository_path,
             repository=app.repository,
         ).stdout
+        self._reject_unusable_codemagic(app, app.release_branch, release_codemagic)
         workflow_names = _codemagic_workflow_names(release_codemagic)
         missing_workflows = [
             name for name in self.inventory.codemagic_checks if name not in workflow_names
@@ -1997,6 +2015,7 @@ class ReleaseOperator:
             cwd=repository_path,
             repository=app.repository,
         ).stdout
+        self._reject_unusable_codemagic(app, app.dev_branch, dev_codemagic)
         dev_workflow_names = _codemagic_workflow_names(dev_codemagic)
         missing_staging = [
             name for name in self.inventory.staging_checks if name not in dev_workflow_names
@@ -2350,6 +2369,61 @@ def _guarded_merge_command(
         "--match-head-commit",
         head_sha,
     ]
+
+
+_MAPPING_KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z_][\w.-]*):(?P<rest>.*)$")
+
+
+def _unusable_codemagic_values(content: str) -> list[str]:
+    """Keys whose value Codemagic will not accept, in the order they appear.
+
+    Codemagic requires a value to be a non-empty string, int, float or bool. An
+    empty or absent one fails validation for the whole file, and a file that
+    fails validation starts no build: the webhook is accepted and nothing is
+    created, so no build, check run or log ever reports the problem.
+
+    Scanning is not limited to `vars:` blocks. The defect this guards against
+    lived in a `definitions:` anchor merged into vars with `<<:`, which a
+    vars-scoped scan would not have seen.
+    """
+    lines = content.splitlines()
+
+    def next_meaningful(start: int) -> tuple[int, str] | None:
+        for line in lines[start:]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            return len(line) - len(line.lstrip(" ")), stripped
+        return None
+
+    offending: list[str] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _MAPPING_KEY.match(line)
+        if match is None:
+            continue
+        rest = match.group("rest").strip()
+        if rest in ('""', "''"):
+            offending.append(match.group("key"))
+            continue
+        if rest:
+            continue
+        # No inline value: a block header if something more deeply indented
+        # follows, otherwise the key carries nothing at all.
+        following = next_meaningful(index + 1)
+        indent = len(match.group("indent"))
+        if following is not None:
+            following_indent, following_text = following
+            if following_indent > indent or (
+                following_text.startswith("-") and following_indent >= indent
+            ):
+                continue
+        offending.append(match.group("key"))
+
+    seen: set[str] = set()
+    return [key for key in offending if not (key in seen or seen.add(key))]
 
 
 def _codemagic_workflow_names(content: str) -> set[str]:
