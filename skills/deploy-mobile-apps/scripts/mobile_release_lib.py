@@ -239,6 +239,9 @@ class ReleaseOperator:
             app_record = self._preflight_app(app, repository_path)
             if app_record["packages_pointer_sha"] != app_record["packages_sha"]:
                 self._verify_deployment_worktree_is_ignored(app, repository_path)
+            app_record["release_ahead_of_dev"] = not self._release_is_contained_in_dev(
+                app, repository_path
+            )
             batch["apps"][app_key] = app_record
 
         batch["state"] = "preflight-complete"
@@ -1855,6 +1858,28 @@ class ReleaseOperator:
                 raise ReleaseError(f"repository {repository}: ambiguous repository match")
             discovered[app_key] = paths[0]
         return discovered
+
+    def _release_is_contained_in_dev(
+        self, app: AppConfig, repository_path: Path
+    ) -> bool:
+        """Whether every release commit has been merged back into dev.
+
+        Release Please writes the version, changelog and manifest on the release
+        branch and nothing carries them back, so the two drift silently. The
+        drift is reported rather than repaired: merging into the branch everyone
+        works on is a human's decision.
+        """
+        command = [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            f"refs/remotes/origin/{app.release_branch}",
+            f"refs/remotes/origin/{app.dev_branch}",
+        ]
+        result = self.runner.run(command, cwd=repository_path, mutates=False)
+        if result.returncode not in (0, 1):
+            raise ReleaseError(self._command_error(app.repository, command, result))
+        return result.returncode == 0
 
     def _preflight_app(self, app: AppConfig, repository_path: Path) -> dict[str, Any]:
         self._run(

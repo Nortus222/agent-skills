@@ -107,6 +107,11 @@ def _batch_warnings(batch: dict[str, Any]) -> list[str]:
             warnings.append(f"{app_key}: {app['error']}")
         if app.get("worktree"):
             warnings.append(f"{app_key}: preserved worktree {app['worktree']}")
+        if app.get("release_ahead_of_dev"):
+            warnings.append(
+                f"{app_key}: release is ahead of dev; merge release back into dev so its "
+                "version, changelog and manifest reach the branch work starts from"
+            )
     if batch.get("state") == "released-builds-unverified":
         warnings.append(
             "no CodeMagic build was observed yet; a queued build registers no check run"
