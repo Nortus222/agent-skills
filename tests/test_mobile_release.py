@@ -1164,6 +1164,8 @@ def successful_preflight_responses(app_count=3):
                 CommandResult(0, CODEMAGIC_YAML, ""),
                 CommandResult(0, "[]\n", ""),
                 CommandResult(0, "", ""),
+                # release is an ancestor of dev: no back-merge outstanding
+                CommandResult(0, "", ""),
             ]
         )
     return responses
