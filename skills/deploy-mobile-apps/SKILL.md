@@ -73,7 +73,6 @@ run still counts as detected. Do not wait for the builds to finish.
 | State or event | Response |
 | --- | --- |
 | codemagic.yaml rejected in preflight | Report the named keys and fix them before pushing. Codemagic requires a non-empty string, int, float or bool; a rejected configuration starts no build and reports no failure. |
-| `release is ahead of dev` warning | Report the drift and offer a back-merge pull request from `release` into `dev`. The human decides; never merge into `dev` unasked. |
 | `staging-complete` | Report each staging check and any diagnosis, then pause for the human to judge the TestFlight build. |
 | Staging build failed | Name the failing step and its log tail from `staging_diagnosis`. Fix the cause and stage again; never promote a red staging build. |
 | Staging check absent | Read `staging_diagnosis.missing`. A build cancelled before it starts registers no check run, so an absent check is not evidence of a broken trigger. |
