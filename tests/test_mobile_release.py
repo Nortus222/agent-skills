@@ -329,8 +329,12 @@ class PreparationRunner:
         remote_dev=None,
         remote_release=None,
         resumed=False,
+        tracks_lockfile=False,
+        lockfile_changed=True,
     ):
         self.calls = []
+        self.tracks_lockfile = tracks_lockfile
+        self.lockfile_changed = lockfile_changed
         self.existing_pr = existing_pr
         self.duplicate_pr = duplicate_pr
         self.failed_checks = failed_checks
@@ -413,7 +417,15 @@ class PreparationRunner:
             return CommandResult(0, "", "")
         if command == ("git", "add", "--", "packages"):
             return CommandResult(0, "", "")
+        if command[:3] == ("git", "ls-tree", "--name-only") and command[-1] == "pubspec.lock":
+            return CommandResult(0, "pubspec.lock\n" if self.tracks_lockfile else "", "")
+        if command == ("flutter", "pub", "get"):
+            return CommandResult(0, "", "")
+        if command == ("git", "add", "--", "pubspec.lock"):
+            return CommandResult(0, "", "")
         if command == ("git", "diff", "--cached", "--name-only"):
+            if self.tracks_lockfile and self.lockfile_changed:
+                return CommandResult(0, "packages\npubspec.lock\n", "")
             return CommandResult(0, "packages\n", "")
         if command[:3] == ("git", "log", "--format=%s"):
             return CommandResult(0, "\n".join(self.carried_commits) + "\n", "")
@@ -1043,6 +1055,8 @@ def prepared_operator(
     push_rejected=False,
     promotion_head_race=False,
     resumed=False,
+    tracks_lockfile=False,
+    lockfile_changed=True,
 ):
     temporary = tempfile.TemporaryDirectory()
     root = Path(temporary.name) / "workspace"
@@ -1073,6 +1087,8 @@ def prepared_operator(
         remote_dev=remote_dev,
         remote_release=remote_release,
         resumed=resumed,
+        tracks_lockfile=tracks_lockfile,
+        lockfile_changed=lockfile_changed,
     )
     store = RecordingBatchStore(Path(temporary.name) / "state")
     operator = ReleaseOperator(
@@ -1620,6 +1636,55 @@ class PrepareTests(unittest.TestCase):
         forced = [call.args for call in operator.runner.calls if "--force" in call.args]
         self.assertEqual([args[:3] for args in forced], [("git", "worktree", "remove")])
         self.assertEqual(result["apps"]["pocket-manage"]["dev_push"], "pushed")
+
+    def test_prepare_regenerates_a_tracked_lockfile_with_the_pointer(self):
+        operator, batch = prepared_operator(tracks_lockfile=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"])
+
+        calls = command_args(operator.runner.calls)
+        checkout = next(i for i, c in enumerate(calls) if c[:4] == ["git", "-C", "packages", "checkout"])
+        pub_get = calls.index(["flutter", "pub", "get"])
+        add_lockfile = calls.index(["git", "add", "--", "pubspec.lock"])
+        commit = next(i for i, c in enumerate(calls) if c[:2] == ["git", "commit"])
+        self.assertLess(checkout, pub_get)
+        self.assertLess(pub_get, add_lockfile)
+        self.assertLess(add_lockfile, commit)
+        pub_call = operator.runner.calls[pub_get]
+        self.assertTrue(pub_call.mutates)
+        self.assertIn(".claude/worktrees/", str(pub_call.cwd))
+        self.assertEqual(result["apps"]["pocket-manage"]["dev_push"], "pushed")
+
+    def test_prepare_commits_the_pointer_alone_when_the_lockfile_is_unchanged(self):
+        operator, batch = prepared_operator(tracks_lockfile=True, lockfile_changed=False)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"])
+
+        self.assertIn(["flutter", "pub", "get"], command_args(operator.runner.calls))
+        self.assertEqual(result["apps"]["pocket-manage"]["dev_push"], "pushed")
+
+    def test_prepare_skips_pub_get_when_the_app_tracks_no_lockfile(self):
+        operator, batch = prepared_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        operator.prepare(batch["batch_id"])
+
+        calls = command_args(operator.runner.calls)
+        self.assertNotIn(["flutter", "pub", "get"], calls)
+        self.assertNotIn(["git", "add", "--", "pubspec.lock"], calls)
+
+    def test_prepare_dry_run_plans_the_lockfile_refresh(self):
+        operator, batch = prepared_operator(tracks_lockfile=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+
+        result = operator.prepare(batch["batch_id"], dry_run=True)
+
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+        planned = result["apps"]["pocket-manage"]["planned_commands"]
+        self.assertIn(["flutter", "pub", "get"], planned)
+        self.assertIn(["git", "add", "--", "pubspec.lock"], planned)
 
     def test_prepare_reports_no_release_changes_as_skip(self):
         operator, batch = prepared_operator(
