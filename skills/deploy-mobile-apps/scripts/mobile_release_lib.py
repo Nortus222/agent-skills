@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 
 _PROMOTED_COMMIT_LIMIT = 20
+_LOCKFILE = "pubspec.lock"
 _CHECKS_NOT_PASSING = "release pull request checks are not passing"
 _CARRIED_SUBJECT_LIMIT = 20
 # Captures the type and summary while dropping any breaking marker, so a bump
@@ -1300,6 +1301,17 @@ class ReleaseOperator:
         app_record["state"] = "prepare-complete"
         return True
 
+    def _tracks_lockfile(
+        self, app: AppConfig, app_record: dict[str, Any], repository_path: Path
+    ) -> bool:
+        """Whether the dev commit being bumped commits a Pub lockfile."""
+        listing = self._run(
+            ["git", "ls-tree", "--name-only", app_record["dev_sha"], "--", _LOCKFILE],
+            cwd=repository_path,
+            repository=app.repository,
+        )
+        return bool(listing.stdout.strip())
+
     def _prepare_development_pointer(
         self,
         batch: dict[str, Any],
@@ -1332,8 +1344,10 @@ class ReleaseOperator:
         branch = f"deploy-mobile-apps/{batch['batch_id']}/{app.key}"
         app_record["worktree"] = str(worktree_path)
         bump_message = self._submodule_bump_message(app, app_record, repository_path)
-        mutation_commands = [
-            ["git", "worktree", "add", "-b", branch, str(worktree_path), app_record["dev_sha"]],
+        worktree_command = [
+            "git", "worktree", "add", "-b", branch, str(worktree_path), app_record["dev_sha"]
+        ]
+        bump_commands = [
             ["git", "submodule", "update", "--init", "--", app.submodule_path],
             [
                 "git",
@@ -1344,9 +1358,15 @@ class ReleaseOperator:
                 app_record["submodule_after"],
             ],
             ["git", "add", "--", app.submodule_path],
-            ["git", "commit", "-m", bump_message],
-            ["git", "push", "origin", f"HEAD:{app.dev_branch}"],
         ]
+        # An app that commits its lockfile resolves path dependencies inside the
+        # submodule, so the lockfile must move with the pointer or CI rejects dev.
+        tracks_lockfile = self._tracks_lockfile(app, app_record, repository_path)
+        if tracks_lockfile:
+            bump_commands += [["flutter", "pub", "get"], ["git", "add", "--", _LOCKFILE]]
+        commit_command = ["git", "commit", "-m", bump_message]
+        push_command = ["git", "push", "origin", f"HEAD:{app.dev_branch}"]
+        mutation_commands = [worktree_command, *bump_commands, commit_command, push_command]
         self._verify_deployment_worktree_is_ignored(app, repository_path)
         if dry_run:
             app_record["planned_commands"].extend(mutation_commands)
@@ -1354,12 +1374,12 @@ class ReleaseOperator:
             return
 
         self._run(
-            mutation_commands[0],
+            worktree_command,
             cwd=repository_path,
             repository=app.repository,
             mutates=True,
         )
-        for command in mutation_commands[1:4]:
+        for command in bump_commands:
             self._run(
                 command,
                 cwd=worktree_path,
@@ -1372,13 +1392,17 @@ class ReleaseOperator:
             cwd=worktree_path,
             repository=app.repository,
         ).stdout.splitlines()
-        if staged_paths not in ([], [app.submodule_path]):
+        allowed_staged = [[], [app.submodule_path]]
+        if tracks_lockfile:
+            allowed_staged.append(sorted([app.submodule_path, _LOCKFILE]))
+        if sorted(staged_paths) not in allowed_staged:
+            expected = f"{app.submodule_path} and {_LOCKFILE}" if tracks_lockfile else app.submodule_path
             raise ReleaseError(
-                f"repository {app.repository}: preparation staged paths other than {app.submodule_path}"
+                f"repository {app.repository}: preparation staged paths other than {expected}"
             )
         if staged_paths:
             self._run(
-                mutation_commands[4],
+                commit_command,
                 cwd=worktree_path,
                 repository=app.repository,
                 mutates=True,
@@ -1395,7 +1419,7 @@ class ReleaseOperator:
             current_dev = self._remote_branch_sha(app, app.dev_branch, repository_path)
             if current_dev != app_record["dev_sha"]:
                 raise ReleaseError(f"repository {app.repository}: origin/dev changed before push")
-            push = self.runner.run(mutation_commands[5], cwd=worktree_path, mutates=True)
+            push = self.runner.run(push_command, cwd=worktree_path, mutates=True)
             if push.returncode != 0:
                 stderr = self._redact(push.stderr.strip()) or "no stderr"
                 raise ReleaseError(f"repository {app.repository}: dev push rejected: {stderr}")

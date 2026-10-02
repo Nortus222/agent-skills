@@ -22,7 +22,9 @@ python scripts/mobile_release.py prepare --batch <batch-id> --json
 `prepare` bumps the submodule on `dev`, fast-forwards the existing `staging` branch
 to that commit, then promotes `staging` to `release`. The staging push starts
 CodeMagic builds publishing to the TestFlight internal dev group and Play internal
-track for each app. Land the staging CI changes and create protected staging
+track for each app. When an app commits `pubspec.lock`, the bump runs `flutter pub get`
+and commits the regenerated lockfile with the pointer, so `flutter` must be on `PATH`.
+Land the staging CI changes and create protected staging
 branches with their webhooks before running a real `prepare`. A dry run only plans
 these steps; it does not verify those prerequisites or start builds.
 
