@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import type { ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { main } from '../../skills/emws-api/scripts/lib/cli.ts';
 
 export type Recorded = { method: string; url: string; headers: Record<string, string | string[] | undefined>; body: string };
 export type Handler = (req: Recorded, res: ServerResponse) => void;
@@ -65,4 +66,25 @@ export function json(res: ServerResponse, status: number, body: unknown, headers
 export function makeJwt(claims: Record<string, unknown>): string {
   const enc = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
   return `${enc({ alg: 'none', typ: 'JWT' })}.${enc(claims)}.sig`;
+}
+
+export async function runCli(
+  argv: string[],
+  o: { dir: string; env?: Record<string, string>; stdin?: string; now?: () => number; cwd?: string },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  let stdout = '';
+  let stderr = '';
+  const code = await main(argv, {
+    stdout: (s) => {
+      stdout += s;
+    },
+    stderr: (s) => {
+      stderr += s;
+    },
+    cwd: o.cwd ?? o.dir,
+    env: { EMWS_CONFIG_DIR: o.dir, ...o.env },
+    stdin: async () => o.stdin ?? '',
+    now: o.now,
+  });
+  return { code, stdout, stderr };
 }
