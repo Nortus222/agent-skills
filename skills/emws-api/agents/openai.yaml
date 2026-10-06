@@ -1,0 +1,4 @@
+interface:
+  display_name: "EMWS API"
+  short_description: "Call and verify the e-manage|ONE API"
+  default_prompt: "Use $emws-api to verify the change against the staging API."

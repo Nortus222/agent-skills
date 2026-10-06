@@ -1,0 +1,30 @@
+{
+  "openapi": "3.0.1",
+  "paths": {
+    "/api/projects": {
+      "get": { "summary": "List projects", "responses": { "200": { "description": "ok" } } },
+      "post": {
+        "summary": "Create project",
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Project" } } } },
+        "responses": { "201": { "description": "created" } }
+      }
+    },
+    "/api/projects/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+      "get": {
+        "summary": "Get project",
+        "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Project" } } } } }
+      }
+    },
+    "/api/receiving/{poId}/lines": { "get": { "summary": "List receiving lines", "responses": { "200": { "description": "ok" } } } },
+    "/api/management/keys": { "get": { "summary": "List API keys", "responses": { "200": { "description": "ok" } } } }
+  },
+  "components": {
+    "schemas": {
+      "Project": {
+        "type": "object",
+        "properties": { "id": { "type": "integer" }, "name": { "type": "string" }, "parent": { "$ref": "#/components/schemas/Project" } }
+      }
+    }
+  }
+}

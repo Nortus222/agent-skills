@@ -1,0 +1,30 @@
+{
+  "environments": {
+    "prod": {
+      "apiBase": "https://emanageone.azure-api.net/emws",
+      "specUrl": "https://emws-data.azurewebsites.net/api/swagger.json"
+    },
+    "staging": {
+      "apiBase": "https://emanageone.azure-api.net/emws-staging",
+      "specUrl": "https://emws-data-staging.azurewebsites.net/api/swagger.json"
+    },
+    "local": {
+      "apiBase": "http://localhost:7071/api",
+      "specUrl": "http://localhost:7071/api/swagger.json"
+    }
+  },
+  "profiles": {
+    "staging-admin": { "env": "staging", "auth": "apiKey", "secret": "STAGING_ADMIN_KEY" },
+    "staging-user": {
+      "env": "staging",
+      "auth": "basic",
+      "username": "user@example.com",
+      "secret": "STAGING_USER_PASSWORD",
+      "clientId": "<client id>",
+      "dbId": "<database id>"
+    },
+    "prod-admin": { "env": "prod", "auth": "apiKey", "secret": "PROD_ADMIN_KEY" },
+    "local": { "env": "local", "auth": "apiKey", "secret": "LOCAL_KEY" }
+  },
+  "defaultProfile": "staging-admin"
+}
