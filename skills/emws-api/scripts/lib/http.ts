@@ -36,12 +36,22 @@ export function traceIdOf(traceparent: string): string {
 const isTextual = (contentType: string): boolean =>
   contentType === '' || /json|text|xml|javascript|x-www-form-urlencoded/i.test(contentType);
 
+type RawJson = { rawJSON: (text: string) => unknown };
+
+/** Keeps integers beyond 2^53 exact, so re-serialised bodies show the IDs the API sent. */
+function exactIntegers(_key: string, value: unknown, context?: { source?: string }): unknown {
+  if (typeof value === 'number' && !Number.isSafeInteger(value) && /^-?\d+$/.test(context?.source ?? '')) {
+    return (JSON as unknown as RawJson).rawJSON(context?.source ?? '');
+  }
+  return value;
+}
+
 /** JSON when it parses, the text otherwise, null when empty. */
 export function parseBody(text: string, contentType: string): unknown {
   if (text === '') return null;
   if (/json/i.test(contentType) || /^\s*[[{]/.test(text)) {
     try {
-      return JSON.parse(text);
+      return JSON.parse(text, exactIntegers as (key: string, value: unknown) => unknown);
     } catch {
       return text;
     }

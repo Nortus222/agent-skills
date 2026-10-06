@@ -117,16 +117,20 @@ function errorEnvelope(
 }
 
 /** Reports a failure of a command that makes no logged HTTP call. */
-function fail(err: unknown, io: Io, flags: Flags): number {
+function fail(err: unknown, io: Io, flags: Flags, redactor: Redactor = createRedactor()): number {
   if (!(err instanceof CliError)) throw err;
-  const env = errorEnvelope(err, { request: null, timingMs: 0 });
+  const env = redactor.value(errorEnvelope(err, { request: null, timingMs: 0 }));
   if (flags.json) io.stdout(`${JSON.stringify(env, null, 2)}\n`);
   else io.stderr(renderError(env));
   return exitCodeFor(err.kind);
 }
 
 function buildUrl(apiBase: string, p: string, query: string[]): string {
-  const url = new URL(`${apiBase.replace(/\/+$/, '')}${p}`);
+  const base = apiBase.replace(/\/+$/, '');
+  const url = new URL(`${base}${p}`);
+  if (!url.href.startsWith(`${new URL(base).href.replace(/\/+$/, '')}/`)) {
+    throw usageError(`the path resolves outside the environment's apiBase (${base})`);
+  }
   for (const pair of query) {
     const i = pair.indexOf('=');
     if (i <= 0) throw usageError(`--query expects key=value, got "${pair}"`);
@@ -173,6 +177,19 @@ function checkPath(p: string | undefined): string {
   if (/^https?:\/\//i.test(p)) throw usageError('paths are relative to the environment; pass /projects/123, not a full URL');
   if (!p.startsWith('/')) throw usageError('the path must start with "/", for example: /projects/123');
   if (/^\/api(\/|$)/i.test(p)) throw usageError('drop the /api prefix; paths are relative to the environment, for example: /projects/123');
+  const dotSegment = p
+    .split(/[?#]/)[0]
+    .split('/')
+    .some((s) => {
+      let decoded = s;
+      try {
+        decoded = decodeURIComponent(s);
+      } catch {
+        // A malformed escape is left for the server to reject.
+      }
+      return decoded === '.' || decoded === '..';
+    });
+  if (dotSegment) throw usageError('dot segments ("." or "..") are not allowed in paths; they could leave the environment');
   return p;
 }
 
@@ -235,6 +252,7 @@ async function runRequest(method: string, rawPath: string | undefined, flags: Fl
     meta.env = ctx.envName;
     const url = buildUrl(ctx.environment.apiBase, p, flags.query ?? []);
     const body = await readBody(flags.body, io);
+    if (body !== undefined && method === 'GET') throw usageError('GET requests cannot carry a body; pass filters with --query');
     meta.requestBody = body ?? null;
     const timeoutMs = flags.timeout ? parseDuration(flags.timeout) : DEFAULT_TIMEOUT_MS;
     const baseHeaders: Record<string, string> = {
@@ -347,8 +365,10 @@ async function runDescribe(method: string | undefined, p: string | undefined, fl
 }
 
 async function runWhoami(flags: Flags, io: Io, dir: string): Promise<number> {
+  const redactor = createRedactor();
   try {
     const ctx = await loadContext({ dir, profile: flags.profile, env: io.env });
+    for (const v of Object.values(ctx.secrets)) redactor.add(v);
     const claims =
       ctx.profile.auth === 'basic'
         ? (await resolveAuth(ctx, { fetchImpl: io.fetchImpl, now: io.now })).claims ?? {}
@@ -368,7 +388,7 @@ async function runWhoami(flags: Flags, io: Io, dir: string): Promise<number> {
     io.stdout(`${JSON.stringify(out, null, 2)}\n`);
     return 0;
   } catch (err) {
-    return fail(err, io, flags);
+    return fail(err, io, flags, redactor);
   }
 }
 

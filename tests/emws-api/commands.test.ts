@@ -128,3 +128,12 @@ test('help prints usage; an unknown command is a usage error', async () => {
   assert.equal(bad.code, 2);
   assert.match(bad.stderr, /unknown command "frobnicate"/);
 });
+
+test('whoami masks a secret echoed back by a failed login', async () => {
+  await withApi((req, res) => json(res, 401, { statusCode: 401, message: `bad key ${req.headers['x-api-key']}` }), async ({ dir }) => {
+    const r = await runCli(['whoami'], { dir });
+    assert.equal(r.code, 3);
+    assert.ok(!r.stderr.includes(SECRETS.STG_KEY), r.stderr);
+    assert.match(r.stderr, /bad key \*\*\*/);
+  });
+});

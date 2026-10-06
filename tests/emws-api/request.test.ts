@@ -283,3 +283,41 @@ test('a large response is printed whole and logged truncated', async () => {
     assert.equal(entry.responseTruncated, true);
   });
 });
+
+test('a path that climbs out of the environment is a usage error before any request', async () => {
+  await withApi((_req, res) => json(res, 200, {}), async ({ dir, requests }) => {
+    for (const p of ['/../emws/projects/1', '/%2e%2e/emws/projects/1', '/projects/./1']) {
+      const r = await runCli(['delete', p, '--json'], { dir });
+      assert.equal(r.code, 2, p);
+      assert.match(JSON.parse(r.stdout).error.message, /dot segments/, p);
+    }
+    assert.equal(requests.length, 0);
+  });
+});
+
+test('a GET with a body is a usage error, not a network failure', async () => {
+  await withApi((_req, res) => json(res, 200, {}), async ({ dir, requests }) => {
+    const r = await runCli(['get', '/projects', '--body', '{}', '--json'], { dir });
+    assert.equal(r.code, 2);
+    const env = JSON.parse(r.stdout);
+    assert.equal(env.error.code, 'USAGE');
+    assert.match(env.error.message, /GET.*body/);
+    assert.equal(requests.length, 0);
+  });
+});
+
+test('integers beyond 2^53 are printed exactly as the API sent them', async () => {
+  await withApi(
+    (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"id":9007199254740993,"ids":[12345678901234567890],"name":"x"}');
+    },
+    async ({ dir }) => {
+      const plain = await runCli(['get', '/projects/1'], { dir });
+      assert.match(plain.stdout, /"id": 9007199254740993/);
+      assert.match(plain.stdout, /12345678901234567890/);
+      const env = await runCli(['get', '/projects/1', '--json'], { dir });
+      assert.match(env.stdout, /"id": 9007199254740993/);
+    },
+  );
+});

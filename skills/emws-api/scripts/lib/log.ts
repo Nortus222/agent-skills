@@ -46,6 +46,12 @@ export async function appendLog(dir: string, entry: LogEntry): Promise<void> {
   await appendFile(path.join(logsDir(dir), `${entry.ts.slice(0, 10)}.jsonl`), `${JSON.stringify(entry)}\n`, { mode: 0o600 });
 }
 
+function isLogEntry(v: unknown): v is LogEntry {
+  if (v === null || typeof v !== 'object') return false;
+  const e = v as Record<string, unknown>;
+  return ['ts', 'callId', 'method', 'path', 'profile'].every((k) => typeof e[k] === 'string');
+}
+
 export async function readLogs(dir: string): Promise<LogEntry[]> {
   let names: string[];
   try {
@@ -58,7 +64,8 @@ export async function readLogs(dir: string): Promise<LogEntry[]> {
     for (const line of (await readFile(path.join(logsDir(dir), name), 'utf8')).split('\n')) {
       if (!line.trim()) continue;
       try {
-        entries.push(JSON.parse(line) as LogEntry);
+        const parsed: unknown = JSON.parse(line);
+        if (isLogEntry(parsed)) entries.push(parsed);
       } catch {
         // A torn or corrupt line is skipped so the rest of the log stays usable.
       }

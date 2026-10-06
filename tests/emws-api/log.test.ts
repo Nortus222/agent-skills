@@ -106,3 +106,10 @@ test('a summary line names status, method, path, profile, and call id', () => {
   const line = formatSummary(entry({ callId: 'c_9', ok: false, status: null, code: 'CONN_REFUSED' }));
   for (const part of ['CONN_REFUSED', 'GET', '/projects/1', 'stg', 'c_9']) assert.ok(line.includes(part), line);
 });
+
+test('skips lines that parse as JSON but are not log entries', async () => {
+  const dir = await tmp();
+  await appendLog(dir, entry({ callId: 'c_1' }));
+  await appendFile(path.join(dir, 'logs', '2026-10-06.jsonl'), 'null\n42\n{}\n"text"\n');
+  assert.deepEqual((await readLogs(dir)).map((e) => e.callId), ['c_1']);
+});

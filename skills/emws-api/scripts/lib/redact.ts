@@ -24,6 +24,7 @@ export function createRedactor(secrets: Iterable<string> = []): Redactor {
 
   const value = <T>(v: T): T => {
     if (typeof v === 'string') return text(v) as T;
+    if ((JSON as unknown as { isRawJSON: (x: unknown) => boolean }).isRawJSON(v)) return v;
     if (Array.isArray(v)) return v.map((x) => value(x)) as T;
     if (v !== null && typeof v === 'object') {
       const out: Record<string, unknown> = {};
