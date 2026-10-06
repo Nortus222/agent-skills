@@ -80,10 +80,14 @@ export function detectSource(body: unknown): ResponseSource {
   return 'unknown';
 }
 
+const MAX_MESSAGE_CHARS = 2000;
+
 export function messageOf(body: unknown, status: number): string {
   if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
     for (const [k, v] of Object.entries(body)) {
-      if (k.toLowerCase() === 'message' && typeof v === 'string' && v) return v;
+      if (k.toLowerCase() === 'message' && typeof v === 'string' && v) {
+        return v.length > MAX_MESSAGE_CHARS ? `${v.slice(0, MAX_MESSAGE_CHARS)}…[truncated]` : v;
+      }
     }
   }
   if (typeof body === 'string') {
@@ -102,6 +106,8 @@ export type HintInput = {
   routeKnown?: boolean;
   suggestions?: string[];
   profile?: string;
+  auth?: 'apiKey' | 'basic';
+  message?: string;
 };
 
 const SERVER_HINT = 'Look up the correlation id in App Insights with the query in correlation.kql.';
@@ -116,6 +122,9 @@ export function hintFor(i: HintInput): string {
   if (i.code === 'TLS') return "TLS handshake failed: check the environment's apiBase scheme and host.";
   if (i.code === 'TIMEOUT') return 'No response before the timeout; retry with --timeout 60s, or check the host.';
   if (i.kind === 'network') return 'The connection failed; retry, and check the host if it repeats.';
+  if (i.status === 401 && i.source === 'apim' && i.auth === 'apiKey') {
+    return "APIM rejected the API key; check the profile's secret in ~/.config/emws/.env and run `emws whoami`.";
+  }
   if (i.status === 401 && i.source === 'apim') {
     return 'APIM rejected the credentials (expired token or wrong issuer). Run `emws whoami` for this profile.';
   }
@@ -128,6 +137,9 @@ export function hintFor(i: HintInput): string {
   }
   if (i.status === 404 && i.routeKnown) return 'The route exists, so the record was not found or is outside this identity\'s access scope.';
   if (i.status === 404) return 'Not found; the route list was unavailable, so run `emws routes <filter>` to check the path.';
+  if (i.kind === 'server' && /temporarily unavailable/i.test(i.message ?? '')) {
+    return 'The API is likely warming up after a deploy, which takes about 30 seconds; retry before treating this as a regression.';
+  }
   if (i.status === 422) return `Unhandled server exception. ${SERVER_HINT}`;
   if (i.kind === 'server') return `Server-side error. ${SERVER_HINT}`;
   if (i.status === 400) return 'The API rejected the request; read error.message and compare the body with `emws describe`.';

@@ -54,10 +54,12 @@ emws post /things --body @payload.json -p staging-admin
 | 6 | Server error (5xx, or 422 for an unhandled exception) |
 | 7 | Network or timeout |
 
-Read `error.message` and `error.hint` first. `response.source` says who rejected the call:
-`apim` is the gateway (usually credentials), `api` is EMWS itself. For a server error, put
-`correlation.correlationId` and `correlation.kql` in your report so the failure can be found
-in App Insights.
+The error report goes to stderr; with `--json` it is one envelope on stdout instead. Read the
+message line and the `hint:` line first (`error.message`, `error.hint` in JSON). The `response
+<status> from <source>` line (`response.source`) says who rejected the call: `apim` is the
+gateway, which also answers unknown routes, and `api` is EMWS itself. For a server error, put the
+`correlation id:` and `kql:` lines (`correlation.correlationId`, `correlation.kql`) in your report
+so the failure can be found in App Insights.
 
 ```bash
 emws log --errors          # recent failures, from every agent on this machine

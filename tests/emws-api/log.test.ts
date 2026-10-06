@@ -113,3 +113,9 @@ test('skips lines that parse as JSON but are not log entries', async () => {
   await appendFile(path.join(dir, 'logs', '2026-10-06.jsonl'), 'null\n42\n{}\n"text"\n');
   assert.deepEqual((await readLogs(dir)).map((e) => e.callId), ['c_1']);
 });
+
+test('summary columns stay aligned for long codes', () => {
+  const a = formatSummary(entry({ status: 200 }));
+  const b = formatSummary(entry({ ok: false, status: null, code: 'WRITE_BLOCKED' }));
+  assert.equal(a.indexOf(' GET '), b.indexOf(' GET '));
+});

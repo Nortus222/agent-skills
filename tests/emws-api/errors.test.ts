@@ -85,3 +85,14 @@ test('renders a readable error with the next steps', () => {
     assert.ok(text.includes(part), `missing "${part}" in:\n${text}`);
   }
 });
+
+test('an APIM 401 on an API-key profile blames the key, not a token', () => {
+  const hint = hintFor({ kind: 'auth', code: 'HTTP_401', status: 401, source: 'apim', auth: 'apiKey' });
+  assert.match(hint, /API key/);
+  assert.doesNotMatch(hint, /issuer/);
+});
+
+test('the post-deploy warm-up 500 says to retry, not to report a regression', () => {
+  const hint = hintFor({ kind: 'server', code: 'HTTP_500', status: 500, message: 'Request recording is temporarily unavailable' });
+  assert.match(hint, /warming up after a deploy/);
+});

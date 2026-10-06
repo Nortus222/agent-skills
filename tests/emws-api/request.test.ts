@@ -321,3 +321,41 @@ test('integers beyond 2^53 are printed exactly as the API sent them', async () =
     },
   );
 });
+
+test('an APIM 401 on an API-key profile points at the key', async () => {
+  await withApi((_req, res) => json(res, 401, { statusCode: 401, message: 'Unauthorized by api key policy' }), async ({ dir }) => {
+    const env = JSON.parse((await runCli(['get', '/projects/1', '--json'], { dir })).stdout);
+    assert.match(env.error.hint, /API key/);
+  });
+});
+
+test('a binary body without a content type prints a placeholder', async () => {
+  await withApi(
+    (_req, res) => {
+      res.writeHead(200);
+      res.end(Buffer.from([0x00, 0xff, 0x10, 0x01]));
+    },
+    async ({ dir }) => {
+      const r = await runCli(['get', '/projects/1'], { dir });
+      assert.equal(r.stdout, '<binary body, 4 bytes, not shown>\n');
+    },
+  );
+});
+
+test('a large error body is capped in the log', async () => {
+  await withApi((_req, res) => json(res, 500, { StatusCode: 500, Message: 'x'.repeat(100_000), ErrorCode: null }), async ({ dir }) => {
+    await runCli(['get', '/projects/1'], { dir });
+    const [entry] = await readLogs(dir);
+    assert.ok(Buffer.byteLength(JSON.stringify(entry.envelope)) < 70_000 * 2, 'envelope stays near the cap');
+    assert.ok(Buffer.byteLength(JSON.stringify(entry)) < 70_000 * 3, 'whole entry stays bounded');
+    assert.ok(Buffer.byteLength(JSON.stringify((entry.envelope as { response: { body: unknown } }).response.body)) <= 66_000);
+  });
+});
+
+test('-v masks cookies in printed headers', async () => {
+  await withApi((_req, res) => json(res, 200, {}, { 'set-cookie': 'session=abc123secret' }), async ({ dir }) => {
+    const r = await runCli(['get', '/projects/1', '-v'], { dir });
+    assert.ok(!r.stderr.includes('abc123secret'), r.stderr);
+    assert.match(r.stderr, /< set-cookie: \*\*\*/);
+  });
+});

@@ -33,8 +33,18 @@ export function traceIdOf(traceparent: string): string {
   return traceparent.split('-')[1] ?? '';
 }
 
-const isTextual = (contentType: string): boolean =>
-  contentType === '' || /json|text|xml|javascript|x-www-form-urlencoded/i.test(contentType);
+const isTextualType = (contentType: string): boolean => /json|text|xml|javascript|x-www-form-urlencoded/i.test(contentType);
+
+/** An untyped body counts as text only when it is valid UTF-8 with no NUL bytes. */
+function looksLikeText(bytes: Buffer): boolean {
+  if (bytes.includes(0)) return false;
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 type RawJson = { rawJSON: (text: string) => unknown };
 
@@ -84,7 +94,8 @@ export async function sendRequest(i: SendInput): Promise<RawResponse> {
         await sleep(250 * 2 ** (attempt - 1));
         continue;
       }
-      const bodyText = isTextual(contentType) ? bytes.toString('utf8') : `<${contentType} body, ${bytes.length} bytes, not shown>`;
+      const textual = contentType ? isTextualType(contentType) : looksLikeText(bytes);
+      const bodyText = textual ? bytes.toString('utf8') : `<${contentType || 'binary'} body, ${bytes.length} bytes, not shown>`;
       return { status: res.status, headers: Object.fromEntries(res.headers), bodyText, contentType, attempts: attempt };
     } catch (err) {
       const e = toCliError(err, i.url);
