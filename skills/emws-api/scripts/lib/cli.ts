@@ -2,15 +2,15 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { resolveAuth } from './auth.ts';
-import { configDir, loadContext } from './config.ts';
+import { exchangeApiKey, resolveAuth } from './auth.ts';
+import { configDir, effectiveAllowWrites, loadConfig, loadContext, loadSecrets, resolveProfileName } from './config.ts';
 import { buildKql, classifyStatus, CliError, detectSource, exitCodeFor, hintFor, messageOf, renderError } from './errors.ts';
 import type { ErrorEnvelope, RequestInfo, ResponseInfo, SuccessEnvelope } from './errors.ts';
 import { isWrite, newCallId, newTraceparent, parseBody, sendRequest, traceIdOf } from './http.ts';
-import { appendLog, gitBranch, parseDuration, pruneLogs, truncateBody } from './log.ts';
+import { appendLog, formatSummary, gitBranch, parseDuration, pruneLogs, queryLogs, readLogs, truncateBody } from './log.ts';
 import { createRedactor } from './redact.ts';
 import type { Redactor } from './redact.ts';
-import { loadSpec, nearestRoutes, pathKnown } from './spec.ts';
+import { describeRoute, listRoutes, loadSpec, nearestRoutes, pathKnown } from './spec.ts';
 
 export type Io = {
   stdout: (s: string) => void;
@@ -309,6 +309,123 @@ async function runRequest(method: string, rawPath: string | undefined, flags: Fl
   }
 }
 
+/** The selected profile's environment and its OpenAPI document; needs no secrets. */
+async function specFor(flags: Flags, io: Io, dir: string) {
+  const config = await loadConfig(dir);
+  const envName = config.profiles[resolveProfileName(config, flags.profile, io.env)].env;
+  return loadSpec({ dir, envName, specUrl: config.environments[envName].specUrl, refresh: flags.refresh, fetchImpl: io.fetchImpl, now: io.now });
+}
+
+async function runRoutes(filter: string | undefined, flags: Flags, io: Io, dir: string): Promise<number> {
+  try {
+    const routes = listRoutes(await specFor(flags, io, dir), filter);
+    if (flags.json) {
+      io.stdout(`${JSON.stringify(routes, null, 2)}\n`);
+    } else {
+      for (const r of routes) io.stdout(`${r.method.padEnd(6)} ${r.path}${r.summary ? `  ${r.summary}` : ''}\n`);
+      if (routes.length === 0) io.stderr(`no routes match "${filter}"\n`);
+    }
+    return 0;
+  } catch (err) {
+    return fail(err, io, flags);
+  }
+}
+
+async function runDescribe(method: string | undefined, p: string | undefined, flags: Flags, io: Io, dir: string): Promise<number> {
+  try {
+    if (!method || !p) throw usageError('describe needs a method and a path, for example: emws describe GET /projects/{id}');
+    const doc = await specFor(flags, io, dir);
+    const route = describeRoute(doc, method, p);
+    if (!route) {
+      throw new CliError('client', 'ROUTE_UNKNOWN', `no ${method.toUpperCase()} route matches ${p}`, `Closest routes: ${nearestRoutes(doc, method, p).join(', ')}`);
+    }
+    io.stdout(`${JSON.stringify(route, null, 2)}\n`);
+    return 0;
+  } catch (err) {
+    return fail(err, io, flags);
+  }
+}
+
+async function runWhoami(flags: Flags, io: Io, dir: string): Promise<number> {
+  try {
+    const ctx = await loadContext({ dir, profile: flags.profile, env: io.env });
+    const claims =
+      ctx.profile.auth === 'basic'
+        ? (await resolveAuth(ctx, { fetchImpl: io.fetchImpl, now: io.now })).claims ?? {}
+        : (await exchangeApiKey(ctx, { fetchImpl: io.fetchImpl })).claims;
+    const out = {
+      profile: ctx.profileName,
+      env: ctx.envName,
+      apiBase: ctx.environment.apiBase,
+      auth: ctx.profile.auth,
+      allowWrites: ctx.allowWrites,
+      sub: claims.sub ?? null,
+      name: claims.name ?? null,
+      database: claims.database ?? null,
+      clientId: claims.client_id ?? null,
+      expires: typeof claims.exp === 'number' ? new Date(claims.exp * 1000).toISOString() : null,
+    };
+    io.stdout(`${JSON.stringify(out, null, 2)}\n`);
+    return 0;
+  } catch (err) {
+    return fail(err, io, flags);
+  }
+}
+
+async function runProfiles(flags: Flags, io: Io, dir: string): Promise<number> {
+  try {
+    const config = await loadConfig(dir);
+    const secrets = await loadSecrets(dir);
+    const selected = io.env.EMWS_PROFILE || config.defaultProfile;
+    const rows = Object.entries(config.profiles).map(([name, p]) => ({
+      name,
+      default: name === selected,
+      env: p.env,
+      auth: p.auth,
+      allowWrites: effectiveAllowWrites(p),
+      secret: secrets[p.secret] ? 'set' : 'missing',
+      apiBase: config.environments[p.env].apiBase,
+    }));
+    if (flags.json) {
+      io.stdout(`${JSON.stringify(rows, null, 2)}\n`);
+    } else {
+      const width = Math.max(...rows.map((r) => r.name.length));
+      for (const r of rows) {
+        io.stdout(`${r.default ? '*' : ' '} ${r.name.padEnd(width)}  ${r.env.padEnd(8)} ${r.auth.padEnd(6)} writes:${r.allowWrites ? 'on ' : 'off'}  secret:${r.secret.padEnd(7)}  ${r.apiBase}\n`);
+      }
+    }
+    return 0;
+  } catch (err) {
+    return fail(err, io, flags);
+  }
+}
+
+async function runLog(callId: string | undefined, flags: Flags, io: Io, dir: string): Promise<number> {
+  try {
+    const last = flags.last === undefined ? undefined : Number(flags.last);
+    if (last !== undefined && (!Number.isInteger(last) || last < 1)) throw usageError(`--last expects a positive whole number, got "${flags.last}"`);
+    const found = queryLogs(await readLogs(dir), {
+      callId,
+      errors: flags.errors,
+      last,
+      sinceMs: flags.since ? parseDuration(flags.since) : undefined,
+      profile: flags.profile,
+      path: flags.path,
+      cwd: flags.here ? io.cwd : undefined,
+      now: (io.now ?? Date.now)(),
+    });
+    if (callId) {
+      if (found.length === 0) throw new CliError('client', 'CALL_UNKNOWN', `no logged call ${callId}`, 'Run `emws log` to list recent calls; logs are kept 14 days.');
+      io.stdout(`${JSON.stringify(found[0], null, 2)}\n`);
+      return 0;
+    }
+    for (const e of found) io.stdout(`${flags.json ? JSON.stringify(e) : formatSummary(e)}\n`);
+    return 0;
+  } catch (err) {
+    return fail(err, io, flags);
+  }
+}
+
 /** Runs one CLI invocation and returns its exit code. */
 export async function main(argv: string[], io: Io): Promise<number> {
   const dir = configDir(io.env);
@@ -328,5 +445,18 @@ export async function main(argv: string[], io: Io): Promise<number> {
     return 0;
   }
   if (HTTP_METHODS.has(command.toLowerCase())) return runRequest(command.toUpperCase(), rest[0], flags, io, dir);
-  return fail(usageError(`unknown command "${command}"`), io, flags);
+  switch (command) {
+    case 'routes':
+      return runRoutes(rest[0], flags, io, dir);
+    case 'describe':
+      return runDescribe(rest[0], rest[1], flags, io, dir);
+    case 'whoami':
+      return runWhoami(flags, io, dir);
+    case 'profiles':
+      return runProfiles(flags, io, dir);
+    case 'log':
+      return runLog(rest[0], flags, io, dir);
+    default:
+      return fail(usageError(`unknown command "${command}"`), io, flags);
+  }
 }
