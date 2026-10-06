@@ -37,3 +37,7 @@ test('masks the longest secret first so no fragment survives', () => {
   const r = createRedactor(['abcd', 'abcdef']);
   assert.equal(r.text('abcdef'), MASK);
 });
+
+test('masks cookie headers', () => {
+  assert.deepEqual(createRedactor().value({ 'set-cookie': 'session=abc', Cookie: 'a=b' }), { 'set-cookie': MASK, Cookie: MASK });
+});

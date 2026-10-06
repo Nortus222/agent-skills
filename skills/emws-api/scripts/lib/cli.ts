@@ -198,6 +198,15 @@ const headerLines = (prefix: string, h: Record<string, string>): string =>
     .map(([k, v]) => `${prefix} ${k}: ${v}\n`)
     .join('');
 
+/** Keeps a logged error envelope within the log's body cap; the parsed body becomes a truncated JSON string. */
+function capErrorEnvelope(env: ErrorEnvelope): ErrorEnvelope {
+  if (!env.response) return env;
+  const serialized = JSON.stringify(env.response.body) ?? '';
+  const capped = truncateBody(serialized);
+  if (!capped.truncated) return env;
+  return { ...env, response: { ...env.response, body: `${capped.body}…[truncated]` } };
+}
+
 /** Prints the envelope per the output contract, appends the redacted log line, and returns the exit code. */
 async function finish(envelope: ErrorEnvelope | SuccessEnvelope, meta: CallMeta, io: Io, flags: Flags, redactor: Redactor, dir: string): Promise<number> {
   const safe = redactor.value(envelope);
@@ -225,7 +234,7 @@ async function finish(envelope: ErrorEnvelope | SuccessEnvelope, meta: CallMeta,
       cwd: io.cwd,
       branch: gitBranch(io.cwd),
       agent: io.env.EMWS_AGENT ?? io.env.CLAUDE_SESSION_ID ?? null,
-      envelope: safe.ok ? { ...safe, body: undefined } : safe,
+      envelope: safe.ok ? { ...safe, body: undefined } : capErrorEnvelope(safe),
       requestBody: redactBody(redactor, meta.requestBody),
       responseBody: response.body,
       responseTruncated: response.truncated,
@@ -305,6 +314,7 @@ async function runRequest(method: string, rawPath: string | undefined, flags: Fl
         // The spec only improves the hint; its absence is reported by the hint itself.
       }
     }
+    const message = messageOf(parsed, res.status);
     const correlationId = res.headers['x-correlation-id'];
     const response: ResponseInfo = { status: res.status, headers: res.headers, body: source === 'unknown' ? clip(res.bodyText, RAW_BODY_BYTES) : parsed, source };
     const failed: ErrorEnvelope = {
@@ -312,8 +322,8 @@ async function runRequest(method: string, rawPath: string | undefined, flags: Fl
       error: {
         kind,
         code,
-        message: messageOf(parsed, res.status),
-        hint: hintFor({ kind, code, status: res.status, source, path: p, routeKnown, suggestions, profile: ctx.profileName }),
+        message,
+        hint: hintFor({ kind, code, status: res.status, source, path: p, routeKnown, suggestions, profile: ctx.profileName, auth: ctx.profile.auth, message }),
       },
       request,
       response,
@@ -383,7 +393,7 @@ async function runWhoami(flags: Flags, io: Io, dir: string): Promise<number> {
       name: claims.name ?? null,
       database: claims.database ?? null,
       clientId: claims.client_id ?? null,
-      expires: typeof claims.exp === 'number' ? new Date(claims.exp * 1000).toISOString() : null,
+      expires: typeof claims.exp === 'number' ? new Date(claims.exp * 1000).toISOString() : 'none (the token has no exp claim)',
     };
     io.stdout(`${JSON.stringify(out, null, 2)}\n`);
     return 0;

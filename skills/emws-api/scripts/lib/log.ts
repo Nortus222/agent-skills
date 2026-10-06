@@ -111,7 +111,7 @@ export function parseDuration(s: string): number {
 }
 
 export function formatSummary(e: LogEntry): string {
-  return `${e.ts.slice(0, 19).replace('T', ' ')}  ${String(e.status ?? e.code).padEnd(12)} ${e.method.padEnd(6)} ${e.path} · ${e.profile} · ${e.timingMs}ms · ${e.callId}`;
+  return `${e.ts.slice(0, 19).replace('T', ' ')}  ${String(e.status ?? e.code).padEnd(14)} ${e.method.padEnd(6)} ${e.path} · ${e.profile} · ${e.timingMs}ms · ${e.callId}`;
 }
 
 export function gitBranch(cwd: string): string | null {

@@ -137,3 +137,9 @@ test('whoami masks a secret echoed back by a failed login', async () => {
     assert.match(r.stderr, /bad key \*\*\*/);
   });
 });
+
+test('whoami says when the token has no expiry', async () => {
+  await withApi((_req, res) => text(res, makeJwt({ database: 'TenantB' })), async ({ dir }) => {
+    assert.equal(JSON.parse((await runCli(['whoami'], { dir })).stdout).expires, 'none (the token has no exp claim)');
+  });
+});

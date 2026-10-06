@@ -6,7 +6,7 @@ export type Redactor = {
 };
 
 export const MASK = '***';
-const SECRET_KEYS = new Set(['password', 'authorization', 'x-api-key']);
+const SECRET_KEYS = new Set(['password', 'authorization', 'x-api-key', 'cookie', 'set-cookie']);
 const MIN_SECRET_LENGTH = 4;
 
 export function createRedactor(secrets: Iterable<string> = []): Redactor {
