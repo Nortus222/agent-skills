@@ -58,6 +58,9 @@ class StepRecorder(ReleaseOperator):
         self.calls.append("verify-staging")
         return True
 
+    def _refresh_staging(self, app, app_record):
+        self.calls.append("refresh-staging")
+
 
 def _batch(state: str = "preflight-complete") -> dict[str, Any]:
     """A batch shaped the way preflight leaves one, for a single app."""
@@ -128,6 +131,7 @@ class StagingOnlyPrepareTests(unittest.TestCase):
         operator.prepare("b" * 32)
 
         self.assertIn("promote", operator.calls)
+        self.assertLess(operator.calls.index("refresh-staging"), operator.calls.index("promote"))
         self.assertIn("discover-versions", operator.calls)
 
     def test_a_dry_run_stops_at_staging_without_touching_anything(self) -> None:

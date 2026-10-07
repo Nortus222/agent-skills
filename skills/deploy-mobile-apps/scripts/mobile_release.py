@@ -15,6 +15,7 @@ from mobile_release_lib import (
     BatchStore,
     ReleaseError,
     ReleaseOperator,
+    SubprocessRunner,
     approval_rows,
     load_inventory,
 )
@@ -33,10 +34,16 @@ class _DiscardingStore:
         return Path()
 
 
-def build_operator(state_root: Path | None = None) -> ReleaseOperator:
+def build_operator(
+    state_root: Path | None = None, *, git_auth: str = "default"
+) -> ReleaseOperator:
     """Build an operator from the files bundled with this skill."""
     inventory = load_inventory(INVENTORY_PATH)
-    return ReleaseOperator(inventory, BatchStore(state_root or DEFAULT_STATE_ROOT))
+    return ReleaseOperator(
+        inventory,
+        BatchStore(state_root or DEFAULT_STATE_ROOT),
+        runner=SubprocessRunner(git_auth=git_auth),
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -73,6 +80,13 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="verify a saved batch read-only")
     status.add_argument("--batch", required=True)
     status.add_argument("--json", action="store_true", dest="as_json")
+    for command in (preflight, prepare, release, status):
+        command.add_argument(
+            "--git-auth",
+            choices=("default", "gh"),
+            default="default",
+            help="opt into gh HTTPS credentials for git subprocesses (default: current auth)",
+        )
     return parser
 
 
@@ -184,6 +198,11 @@ def _print_human(
             f"checks={_format_checks(row.get('checks'))}",
             f"head={row.get('head_sha') or '-'}",
             f"staging={row.get('staging_sha') or '-'}",
+            "staging-checks=" + _format_checks([
+                {"name": name, **check}
+                for name, check in row.get("staging_checks", {}).items()
+            ]),
+            "staging-missing=" + (",".join(row.get("staging_missing_checks", [])) or "-"),
             f"branches={' → '.join(row.get('branches', [])) or '-'}",
             f"submodule={row.get('submodule_sha') or '-'}",
             f"result={row.get('result') or '-'}",
@@ -227,7 +246,7 @@ def _print_result(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    operator = build_operator()
+    operator = build_operator(git_auth=args.git_auth)
     recovery_batch = getattr(args, "batch", None)
     warnings: list[str] = []
     next_command_override = None
@@ -282,11 +301,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         saved = error.recovery_batch
         if saved is None and recovery_batch:
             try:
-                saved = operator.status(recovery_batch)
+                saved = operator.store.load(recovery_batch)
             except (OSError, ValueError, ReleaseError):
                 saved = None
         if args.as_json:
             recovery = _summary_document(saved) if saved is not None else None
+            if error.recovery:
+                recovery = {**(recovery or {}), **error.recovery}
             print(json.dumps({"error": str(error), "recovery": recovery}, sort_keys=True))
         else:
             print(f"Release failed: {error}", file=sys.stderr)

@@ -37,6 +37,9 @@ python scripts/mobile_release.py prepare --batch <batch-id> --staging-only --jso
 
 That rests at `staging-complete` and reports the staging builds. Resume the same
 batch with a plain `prepare` to promote it; the submodule bump is not repeated.
+Resumed `prepare` refreshes the checks and diagnosis for each saved staging SHA
+before promotion. A failed staging check blocks promotion. `release` refreshes
+the same fields for its report without replacing the release result.
 Prefer `--staging-only` whenever the batch carries a change no store build has
 exercised yet.
 
@@ -75,7 +78,9 @@ run still counts as detected. Do not wait for the builds to finish.
 | codemagic.yaml rejected in preflight | Report the named keys and fix them before pushing. Codemagic requires a non-empty string, int, float or bool; a rejected configuration starts no build and reports no failure. |
 | `staging-complete` | Report each staging check and any diagnosis, then pause for the human to judge the TestFlight build. |
 | Staging build failed | Name the failing step and its log tail from `staging_diagnosis`. Fix the cause and stage again; never promote a red staging build. |
-| Staging check absent | Read `staging_diagnosis.missing`. A build cancelled before it starts registers no check run, so an absent check is not evidence of a broken trigger. |
+| Staging check absent | Run `status` to refresh the saved staging SHA's checks and read `staging_diagnosis.missing`. Queued or cancelled builds may register no check run; the diagnosis queries builds for the matched app and staging branch. |
+| No CodeMagic application matched | The lookup uses the exact GitHub repository in `/apps`, normalizing case, SSH URLs, and `.git`. Verify that the token can see that repository's app and its repository URL is correct, then rerun `status`. App names and repository prefixes do not match. |
+| Git authentication failed | Load the intended SSH key with `ssh-add <key-path>` and retry, or verify the account with `gh auth status --hostname github.com` and explicitly opt into `--git-auth gh`. Promotion and release merges use admin privileges. |
 | `awaiting-approval` | Show the complete batch summary and pause. |
 | Approval snapshot changed | Refuse the changed Release Please head, show the refreshed summary, and request new confirmation. |
 | App skipped | Keep it in the summary with its recorded reason. Never merge it. |
@@ -99,6 +104,26 @@ that the diagnosis is unavailable.
 Use `python scripts/mobile_release.py status --batch <batch-id> --json` for read-only
 recovery and observation. On any command failure, report completed actions, the saved
 state, warnings, and the printed safe resume command.
+
+`status` refreshes staging checks, missing checks, failed checks, and diagnosis for
+each saved staging SHA. It leaves the saved batch and remote state unchanged.
+
+For SSH authentication failures such as `Permission denied (publickey)`, the error
+includes recovery advice even when preflight has not saved a batch. Load the
+intended SSH key, or check `gh auth status --hostname github.com` and use:
+
+```bash
+python scripts/mobile_release.py preflight --git-auth gh --json
+python scripts/mobile_release.py prepare --batch <batch-id> --git-auth gh --json
+```
+
+Repeat `--git-auth gh` on each command that needs it, including `release` or
+`status`. It routes `git@github.com:` remotes over HTTPS and resets the GitHub
+credential helper to `gh auth git-credential` through environment-only git config.
+Existing environment config is preserved. The flag applies only to the script's
+git subprocesses and their children; it changes no saved git configuration.
+The gh account may differ from the SSH identity, so verify it before opting in.
+Without the flag, git uses the current authentication configuration.
 
 ## Common mistakes
 
