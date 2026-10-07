@@ -129,7 +129,7 @@ class CliTests(unittest.TestCase):
         with mock.patch.object(mobile_release, "build_operator") as factory:
             operator = factory.return_value
             operator.release.side_effect = ReleaseError("approval snapshot changed")
-            operator.status.return_value = self._batch()
+            operator.store.load.return_value = self._batch()
             stdout = io.StringIO()
             stderr = io.StringIO()
             with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
@@ -578,6 +578,18 @@ class PreparationRunner:
             self.remote_release = "2" * 40
             return CommandResult(0, "", "")
         if command[:2] == ("gh", "api"):
+            if command[2].endswith("/check-runs"):
+                names = load_inventory(SKILL_ROOT / "references/apps.json").staging_checks
+                return CommandResult(
+                    0,
+                    json.dumps({"check_runs": [
+                        {"name": name, "status": "completed", "conclusion": "success",
+                         "details_url": "https://codemagic.io/app/6279a0f0460c338024f89175/build/6ac5cd662e8bb15cf3973e51",
+                         "app": {"name": "Codemagic CI/CD"}}
+                        for name in names
+                    ]}),
+                    "",
+                )
             content = base64.b64encode(json.dumps({".": "2.7.0"}).encode()).decode()
             return CommandResult(
                 0,
@@ -2110,6 +2122,8 @@ class DiscoveryTests(unittest.TestCase):
                     "labels": ["autorelease: pending"],
                     "head_sha": "a" * 40,
                     "staging_sha": None,
+                    "staging_checks": {},
+                    "staging_missing_checks": [],
                     "branches": [],
                     "submodule_sha": "f" * 40,
                     "result": "ready for approval",

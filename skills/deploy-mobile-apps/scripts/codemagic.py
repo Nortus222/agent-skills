@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -25,7 +26,7 @@ KEYCHAIN_SERVICE = "CODEMAGIC_API_TOKEN"
 TOKEN_VARIABLE = "CODEMAGIC_API_TOKEN"
 
 # CodeMagic check runs link to https://codemagic.io/app/<appId>/build/<buildId>,
-# which is the only place the skill learns either id. Both are 24-hex Mongo ids.
+# which exposes both ids. Both are 24-hex Mongo ids.
 _BUILD_URL = re.compile(
     r"https://codemagic\.io/app/(?P<app>[0-9a-f]{24})/build/(?P<build>[0-9a-f]{24})"
 )
@@ -72,6 +73,26 @@ def build_reference(details_url: str | None) -> BuildReference | None:
     if match is None:
         return None
     return BuildReference(match.group("app"), match.group("build"))
+
+
+def _github_repository(value: Any) -> str | None:
+    """Normalize a GitHub URL or owner/repo without accepting another host."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.lower().startswith("git@github.com:"):
+        path = value.split(":", 1)[1]
+    elif "://" in value:
+        url = urllib.parse.urlsplit(value)
+        if url.hostname != "github.com":
+            return None
+        path = url.path
+    else:
+        path = value
+    path = path.strip("/").lower().removesuffix(".git")
+    if not re.fullmatch(r"[^/\s:]+/[^/\s:]+", path):
+        return None
+    return path
 
 
 def failed_steps(build: dict[str, Any]) -> list[dict[str, Any]]:
@@ -134,9 +155,39 @@ class CodemagicClient:
             raise CodemagicError(f"build {build_id}: unexpected response shape")
         return build
 
+    def application_for_repository(self, repository: str) -> str | None:
+        """Find the exact GitHub repository, including apps without check runs."""
+        expected = _github_repository(repository)
+        if expected is None:
+            raise CodemagicError(f"not a GitHub repository: {repository}")
+        payload = self._get_json(f"{API_ROOT}/apps")
+        applications = (
+            payload.get("applications") if isinstance(payload, dict) else None
+        )
+        if not isinstance(applications, list):
+            raise CodemagicError("unexpected response shape listing applications")
+        matches: set[str] = set()
+        for application in applications:
+            if not isinstance(application, dict):
+                continue
+            source = application.get("repository")
+            source = source if isinstance(source, dict) else {}
+            urls = [source.get("htmlUrl"), application.get("repositoryUrl")]
+            if any(_github_repository(url) == expected for url in urls):
+                app_id = application.get("_id")
+                if not isinstance(app_id, str) or not app_id:
+                    raise CodemagicError(f"application for {repository} has no id")
+                matches.add(app_id)
+        if len(matches) > 1:
+            raise CodemagicError(
+                f"multiple CodeMagic applications matched {repository}"
+            )
+        return next(iter(matches), None)
+
     def builds_for_branch(self, app_id: str, branch: str) -> list[dict[str, Any]]:
         """Recent builds of one application on one branch, newest first."""
-        payload = self._get_json(f"{API_ROOT}/builds")
+        query = urllib.parse.urlencode({"appId": app_id, "branch": branch})
+        payload = self._get_json(f"{API_ROOT}/builds?{query}")
         builds = payload.get("builds") if isinstance(payload, dict) else None
         if not isinstance(builds, list):
             raise CodemagicError("unexpected response shape listing builds")
@@ -169,4 +220,6 @@ class CodemagicClient:
         try:
             return json.loads(body)
         except json.JSONDecodeError as error:
-            raise CodemagicError(f"CodeMagic returned invalid JSON for {url}") from error
+            raise CodemagicError(
+                f"CodeMagic returned invalid JSON for {url}"
+            ) from error

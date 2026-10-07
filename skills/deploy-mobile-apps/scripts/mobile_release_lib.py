@@ -49,9 +49,11 @@ class ReleaseError(RuntimeError):
         message: str,
         *,
         recovery_batch: dict[str, Any] | None = None,
+        recovery: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.recovery_batch = recovery_batch
+        self.recovery = recovery
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,9 @@ class PollPolicy:
 
 
 class SubprocessRunner:
+    def __init__(self, *, git_auth: str = "default") -> None:
+        self.git_auth = git_auth
+
     def run(
         self,
         args: Sequence[str],
@@ -103,8 +108,22 @@ class SubprocessRunner:
         cwd: Path | None = None,
         mutates: bool = False,
     ) -> CommandResult:
+        options = {}
+        if args[0] == "git" and self.git_auth == "gh":
+            environ = dict(os.environ)
+            count = int(environ.get("GIT_CONFIG_COUNT", "0"))
+            config = (
+                ("url.https://github.com/.insteadOf", "git@github.com:"),
+                ("credential.https://github.com.helper", ""),
+                ("credential.https://github.com.helper", "!gh auth git-credential"),
+            )
+            for offset, (key, value) in enumerate(config, start=count):
+                environ[f"GIT_CONFIG_KEY_{offset}"] = key
+                environ[f"GIT_CONFIG_VALUE_{offset}"] = value
+            environ["GIT_CONFIG_COUNT"] = str(count + len(config))
+            options["env"] = environ
         completed = subprocess.run(
-            list(args), cwd=cwd, text=True, capture_output=True, check=False
+            list(args), cwd=cwd, text=True, capture_output=True, check=False, **options
         )
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
@@ -283,6 +302,8 @@ class ReleaseOperator:
             self._initialize_preparation_record(app_record)
             try:
                 if self._completed_preparation_is_current(app, app_record):
+                    if not dry_run:
+                        self._refresh_staging(app, app_record)
                     continue
                 self._prepare_development_pointer(
                     batch,
@@ -295,6 +316,8 @@ class ReleaseOperator:
                     if not dry_run:
                         self._verify_staging(batch, app, app_record)
                     continue
+                if not dry_run:
+                    self._check_staging_before_promotion(batch, app, app_record)
                 self._promote_development(
                     batch,
                     app,
@@ -400,6 +423,9 @@ class ReleaseOperator:
             raise ReleaseError(
                 f"batch {batch_id}: release is not allowed from its current state"
             )
+
+        for app_key in batch["selected_apps"]:
+            self._refresh_staging(self.inventory.apps[app_key], batch["apps"][app_key])
 
         included = [
             app_key
@@ -560,8 +586,11 @@ class ReleaseOperator:
         return batch
 
     def status(self, batch_id: str) -> dict[str, Any]:
-        """Load persisted batch status without querying or changing remote state."""
-        return self.store.load(batch_id)
+        """Refresh staging observations without saving or changing remote state."""
+        batch = self.store.load(batch_id)
+        for app_key in batch["selected_apps"]:
+            self._refresh_staging(self.inventory.apps[app_key], batch["apps"][app_key])
+        return batch
 
     def _current_release_snapshot(
         self, app: AppConfig, app_record: dict[str, Any]
@@ -821,9 +850,30 @@ class ReleaseOperator:
         app_record: dict[str, Any],
     ) -> bool:
         """Observe the staging builds the fast-forward push started."""
+        if not app_record.get("staging_sha"):
+            return False
+        self._refresh_staging(app, app_record)
+        checks = app_record["staging_checks"]
+        missing = app_record["staging_missing_checks"]
+        failed = app_record["staging_failed_checks"]
+        app_record.update(
+            {
+                "state": "staging-complete",
+                "status": "staged",
+                "error": None,
+                "result": _staging_result(checks, missing, failed),
+            }
+        )
+        self.store.save(batch)
+        return bool(checks) and not missing and not failed
+
+    def _refresh_staging(
+        self, app: AppConfig, app_record: dict[str, Any]
+    ) -> None:
+        """Replace check observations for the saved staging SHA, preserving lifecycle state."""
         staging_sha = app_record.get("staging_sha")
         if not staging_sha:
-            return False
+            return
         checks, missing = self._wait_for_codemagic_checks(
             app, staging_sha, self.inventory.staging_checks
         )
@@ -840,14 +890,22 @@ class ReleaseOperator:
                 "staging_diagnosis": self._diagnose_staging(
                     app, staging_sha, checks, missing
                 ),
-                "state": "staging-complete",
-                "status": "staged",
-                "error": None,
-                "result": _staging_result(checks, missing, failed),
             }
         )
+        if app_record.get("status") == "staged":
+            app_record["result"] = _staging_result(checks, missing, failed)
+
+    def _check_staging_before_promotion(
+        self, batch: dict[str, Any], app: AppConfig, app_record: dict[str, Any]
+    ) -> None:
+        """Save current staging observations and refuse an observed failure."""
+        self._refresh_staging(app, app_record)
         self.store.save(batch)
-        return bool(checks) and not missing and not failed
+        if app_record.get("staging_failed_checks"):
+            raise ReleaseError(
+                f"repository {app.repository}: staging checks failed: "
+                + ", ".join(app_record["staging_failed_checks"])
+            )
 
     def _diagnose_staging(
         self,
@@ -857,6 +915,10 @@ class ReleaseOperator:
         missing: Sequence[str],
     ) -> dict[str, Any]:
         """Explain each failed or absent staging build, as far as CodeMagic will say."""
+        if not missing and not any(
+            check.get("conclusion") in _FAILING_CONCLUSIONS for check in checks.values()
+        ):
+            return {}
         client = self._codemagic_client()
         if client is None:
             return {
@@ -908,10 +970,10 @@ class ReleaseOperator:
         A build cancelled before it starts registers no GitHub check run at all, so
         an absent check is not evidence that the trigger is misconfigured.
         """
-        app_id = self._codemagic_app_id(client, app, checks)
-        if app_id is None:
-            return {"workflows": missing, "note": "no CodeMagic application matched"}
         try:
+            app_id = self._codemagic_app_id(client, app, checks)
+            if app_id is None:
+                return {"workflows": missing, "note": "no CodeMagic application matched"}
             builds = client.builds_for_branch(app_id, app.staging_branch)
         except codemagic.CodemagicError as error:
             return {"workflows": missing, "error": str(error)}
@@ -938,12 +1000,12 @@ class ReleaseOperator:
         app: AppConfig,
         checks: dict[str, dict[str, Any]],
     ) -> str | None:
-        """The CodeMagic application id, from an observed check run if one exists."""
+        """Resolve the app from a check run, else its exact GitHub repository."""
         for check in checks.values():
             reference = codemagic.build_reference(check.get("details_url"))
             if reference is not None:
                 return reference.app_id
-        return None
+        return client.application_for_repository(app.repository)
 
     def _codemagic_client(self) -> "codemagic.CodemagicClient | None":
         """The diagnostics client, or None when no token is configured."""
@@ -1086,10 +1148,42 @@ class ReleaseOperator:
     ) -> str:
         command = self._redact(shlex.join(args))
         stderr = self._redact(result.stderr.strip()) or "no stderr"
-        return (
+        message = (
             f"repository {repository}: command `{command}` failed with exit code "
             f"{result.returncode}: {stderr}"
         )
+        recovery = self._git_auth_recovery(args, result)
+        if recovery:
+            message += " Git authentication recovery: " + " ".join(recovery["git_auth"])
+        return message
+
+    @staticmethod
+    def _git_auth_recovery(
+        args: Sequence[str], result: CommandResult
+    ) -> dict[str, Any] | None:
+        if args[0] != "git":
+            return None
+        stderr = result.stderr.lower()
+        if not any(
+            marker in stderr
+            for marker in (
+                "permission denied (publickey",
+                "authentication failed",
+                "could not read username",
+                "could not read password",
+            )
+        ):
+            return None
+        return {
+            "git_auth": [
+                "Load the intended SSH key into the agent with `ssh-add /path/to/key` "
+                "and retry the same command.",
+                "Or verify the intended GitHub account with `gh auth status --hostname "
+                "github.com`, then retry with `--git-auth gh` to opt into HTTPS using "
+                "the gh login. Release merges use admin privileges; the gh account "
+                "may differ from the SSH identity.",
+            ]
+        }
 
     def _wait_for_release_workflow(self, app: AppConfig, release_sha: str) -> None:
         deadline = self.clock.monotonic() + self.poll_policy.timeout_seconds
@@ -1700,6 +1794,8 @@ class ReleaseOperator:
                 f"{pull_request_state.get('mergeStateStatus')})"
             )
 
+        # PR checks may have waited for the staging builds to finish.
+        self._check_staging_before_promotion(batch, app, app_record)
         self._run(
             _guarded_merge_command(
                 app.repository,
@@ -2210,11 +2306,9 @@ class ReleaseOperator:
         result = self.runner.run(args, cwd=cwd, mutates=mutates)
         if result.returncode == 0:
             return result
-        command = self._redact(shlex.join(args))
-        stderr = self._redact(result.stderr.strip()) or "no stderr"
         raise ReleaseError(
-            f"repository {repository}: command `{command}` failed with exit code "
-            f"{result.returncode}: {stderr}"
+            self._command_error(repository, args, result),
+            recovery=self._git_auth_recovery(args, result),
         )
 
     def _redact(self, text: str) -> str:
@@ -2255,6 +2349,8 @@ def approval_rows(batch: dict[str, Any]) -> list[dict[str, Any]]:
                 "labels": app.get("release_pr_labels", []),
                 "head_sha": app.get("release_pr_head_sha"),
                 "staging_sha": app.get("staging_sha"),
+                "staging_checks": app.get("staging_checks", {}),
+                "staging_missing_checks": app.get("staging_missing_checks", []),
                 "branches": app.get("branches", []),
                 "submodule_sha": app.get("submodule_sha", app.get("packages_sha")),
                 "result": app.get("result", app.get("skip_reason")),
@@ -2281,6 +2377,11 @@ def _staging_result(
         return f"staged; CodeMagic builds failed: {', '.join(failed)}"
     if missing:
         return f"staged; builds started, not yet reported: {', '.join(missing)}"
+    if any(
+        check.get("status") != "completed" or check.get("conclusion") != "success"
+        for check in checks.values()
+    ):
+        return "staged; CodeMagic staging builds in progress"
     return "staged; CodeMagic staging builds passed"
 
 
