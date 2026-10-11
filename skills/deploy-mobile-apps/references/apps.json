@@ -11,9 +11,39 @@
     "Build Android AppBundle and Publish to Internal Testing"
   ],
   "apps": {
-    "pocket-manage": {"display_name": "Pocket Manage", "repository": "MarketplaceSoftware/pocketmanage", "directory": "pocketmanage"},
-    "installers": {"display_name": "Pocket Manage Installers", "repository": "MarketplaceSoftware/pocketmanage_installers", "directory": "pocketmanage_installers"},
-    "partner": {"display_name": "Pocket Manage Partner", "repository": "MarketplaceSoftware/pocketmanage_partner", "directory": "pocketmanage_partner"}
+    "pocket-manage": {
+      "display_name": "Pocket Manage",
+      "repository": "MarketplaceSoftware/pocketmanage",
+      "directory": "pocketmanage"
+    },
+    "installers": {
+      "display_name": "Pocket Manage Installers",
+      "repository": "MarketplaceSoftware/pocketmanage_installers",
+      "directory": "pocketmanage_installers"
+    },
+    "partner": {
+      "display_name": "Pocket Manage Partner",
+      "repository": "MarketplaceSoftware/pocketmanage_partner",
+      "directory": "pocketmanage_partner"
+    },
+    "go-measure": {
+      "display_name": "Go Measure",
+      "repository": "MarketplaceSoftware/go_measure",
+      "directory": "go_measure",
+      "workflow": "pinned-staging",
+      "release_notes_file": "release_notes.json",
+      "runbook": "docs/codemagic-publishing.md",
+      "staging_checks": [
+        "Android internal testing",
+        "iOS external TestFlight",
+        "Firebase staging"
+      ],
+      "codemagic_checks": [
+        "Android production",
+        "iOS App Store",
+        "Firebase production"
+      ]
+    }
   },
   "defaults": {
     "dev_branch": "dev",
@@ -22,6 +52,12 @@
     "submodule_path": "packages",
     "submodule_branch": "main",
     "release_label": "autorelease: pending",
-    "release_manifest": ".release-please-manifest.json"
-  }
+    "release_manifest": ".release-please-manifest.json",
+    "workflow": "managed-release"
+  },
+  "default_apps": [
+    "pocket-manage",
+    "installers",
+    "partner"
+  ]
 }

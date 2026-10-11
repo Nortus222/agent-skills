@@ -1,4 +1,4 @@
 interface:
   display_name: "Deploy Mobile Apps"
-  short_description: "Coordinate guarded mobile app releases"
-  default_prompt: "Use $deploy-mobile-apps to prepare and release the managed mobile apps."
+  short_description: "Deploy Pocket Manage and GO Measure safely"
+  default_prompt: "Use $deploy-mobile-apps to select an app and prepare its authorized deployment."

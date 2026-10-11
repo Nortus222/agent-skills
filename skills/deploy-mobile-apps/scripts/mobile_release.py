@@ -24,7 +24,7 @@ from mobile_release_lib import (
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY_PATH = SKILL_ROOT / "references" / "apps.json"
 DEFAULT_STATE_ROOT = Path("~/.local/state/deploy-mobile-apps").expanduser()
-COMMAND_PREFIX = "python scripts/mobile_release.py"
+COMMAND_PREFIX = "python3 scripts/mobile_release.py"
 
 
 class _DiscardingStore:
@@ -56,8 +56,10 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         dest="apps",
         metavar="KEY",
-        help="select an app; repeat for multiple apps (default: all)",
+        help="select an app; repeat for multiple apps (default: configured default apps)",
     )
+    preflight.add_argument("--repository", type=Path, help="explicit checkout for one pinned-staging app; origin is verified")
+    preflight.add_argument("--source", help="full dev or notes-only descendant commit SHA for pinned staging")
     preflight.add_argument("--dry-run", action="store_true")
     preflight.add_argument("--json", action="store_true", dest="as_json")
 
@@ -95,6 +97,13 @@ def _next_command(batch: dict[str, Any]) -> str | None:
     if not batch_id:
         return None
     state = batch.get("state")
+    if state == "prepare-failed" and batch.get("workflow") == "pinned-staging":
+        app_key = batch['selected_apps'][0]
+        record = batch['apps'][app_key]
+        return shlex.join([
+            *shlex.split(COMMAND_PREFIX), 'preflight', '--app', app_key,
+            '--repository', record['repository_path'], '--source', record['source_sha'], '--json',
+        ])
     if state in {
         "preflight-complete",
         "prepare-failed",
@@ -106,9 +115,9 @@ def _next_command(batch: dict[str, Any]) -> str | None:
         return f"{COMMAND_PREFIX} prepare --batch {batch_id}"
     if state == "awaiting-approval":
         return f"{COMMAND_PREFIX} release --batch {batch_id}"
-    if state in {"partial-release", "release-failed"}:
+    if state in {"partial-release", "release-failed", "push-in-progress", "push-failed"}:
         return f"{COMMAND_PREFIX} release --batch {batch_id}"
-    if state == "released-builds-unverified":
+    if state in {"released-builds-unverified", "push-outcome-unverified"}:
         return f"{COMMAND_PREFIX} status --batch {batch_id}"
     return None
 
@@ -161,7 +170,7 @@ def _summary_document(
 
 def _observe_status(operator: ReleaseOperator, batch_id: str) -> dict[str, Any]:
     batch = operator.status(batch_id)
-    if batch.get("state") != "released-builds-unverified":
+    if batch.get("workflow") == "pinned-staging" or batch.get("state") != "released-builds-unverified":
         return batch
 
     observed = copy.deepcopy(batch)
@@ -244,6 +253,22 @@ def _print_result(
         _print_human(batch, warnings, next_command_override=next_command_override)
 
 
+def _preflight_command(args: argparse.Namespace, *, preserve_dry_run: bool = False) -> str:
+    """Retain explicit selection and authentication options in preflight recovery."""
+    command = [*shlex.split(COMMAND_PREFIX), "preflight"]
+    for key in args.apps or []:
+        command += ["--app", key]
+    if args.repository is not None:
+        command += ["--repository", str(args.repository)]
+    if args.source is not None:
+        command += ["--source", args.source]
+    if args.git_auth != "default":
+        command += ["--git-auth", args.git_auth]
+    if preserve_dry_run and args.dry_run:
+        command += ["--dry-run"]
+    return shlex.join([*command, "--json"])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     operator = build_operator(git_auth=args.git_auth)
@@ -253,15 +278,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "preflight":
-            selected_apps = args.apps or list(operator.inventory.apps)
-            if len(selected_apps) < len(operator.inventory.apps):
+            default_apps = list(operator.inventory.default_apps) or list(operator.inventory.apps)
+            selected_apps = args.apps or default_apps
+            if set(selected_apps).issubset(default_apps) and len(selected_apps) < len(default_apps):
                 warning = "partial batch: fewer than all configured apps are selected"
                 warnings.append(warning)
                 print(f"Warning: {warning}", file=sys.stderr, flush=True)
-            batch = operator.preflight(selected_apps, dry_run=args.dry_run)
+            options = {}
+            if args.repository is not None:
+                options["repository_path"] = args.repository
+            if args.source is not None:
+                options["source_sha"] = args.source
+            batch = operator.preflight(selected_apps, dry_run=args.dry_run, **options)
             if args.dry_run:
                 warnings.append("dry-run preflight was not saved")
-                next_command_override = f"{COMMAND_PREFIX} preflight --json"
+                next_command_override = _preflight_command(args)
         elif args.command == "prepare":
             if args.staging_only:
                 warnings.append(
@@ -290,6 +321,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch = operator.release(args.batch, dry_run=args.dry_run)
         else:
             batch = _observe_status(operator, args.batch)
+        if batch.get("workflow") == "pinned-staging":
+            warnings = [warning for warning in warnings if not warning.startswith(("prepare pushes", "staging-only:", "dry run only", "dry run: approval"))]
+            if args.command == "prepare":
+                warnings.append("pinned-staging prepare creates an exact-tree candidate without publishing")
+            if args.command == "release" and args.dry_run:
+                warnings.append("dry run: staging snapshot validated; no publishing push ran")
         _print_result(
             batch,
             as_json=args.as_json,
@@ -304,15 +341,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 saved = operator.store.load(recovery_batch)
             except (OSError, ValueError, ReleaseError):
                 saved = None
+        retry = None
+        if saved is None and args.command == "preflight" and (
+            args.apps or args.repository is not None or args.source is not None
+            or args.git_auth != "default" or args.dry_run
+        ):
+            retry = _preflight_command(args, preserve_dry_run=True)
         if args.as_json:
             recovery = _summary_document(saved) if saved is not None else None
             if error.recovery:
                 recovery = {**(recovery or {}), **error.recovery}
+            if retry:
+                recovery = {**(recovery or {}), "next_command": retry}
             print(json.dumps({"error": str(error), "recovery": recovery}, sort_keys=True))
         else:
             print(f"Release failed: {error}", file=sys.stderr)
             if saved is not None:
                 _print_human(saved, stream=sys.stderr)
+            elif retry:
+                print(f"Next command: {retry}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

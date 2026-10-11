@@ -84,7 +84,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(document["batch_id"], "batch-1")
         self.assertEqual(
             document["next_command"],
-            "python scripts/mobile_release.py preflight --json",
+            "python3 scripts/mobile_release.py preflight --json",
         )
         self.assertIn("dry-run preflight was not saved", document["warnings"])
 
@@ -122,7 +122,7 @@ class CliTests(unittest.TestCase):
         self.assertIn(f"submodule={'b' * 40}", output)
         self.assertIn("preserved worktree /tmp/preserved", output)
         self.assertIn(
-            "python scripts/mobile_release.py release --batch batch-1", output
+            "python3 scripts/mobile_release.py release --batch batch-1", output
         )
 
     def test_release_error_prints_one_json_recovery_document(self):
@@ -146,7 +146,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(document["recovery"]["state"], "awaiting-approval")
         self.assertEqual(
             document["recovery"]["next_command"],
-            "python scripts/mobile_release.py release --batch batch-1",
+            "python3 scripts/mobile_release.py release --batch batch-1",
         )
 
     def test_preflight_json_error_has_null_recovery_without_a_saved_batch(self):
@@ -168,12 +168,12 @@ class CliTests(unittest.TestCase):
 
     def test_next_commands_match_the_skill_invocation(self):
         expected = {
-            "preflight-complete": "python scripts/mobile_release.py prepare --batch batch-1",
-            "dry-run-complete": "python scripts/mobile_release.py prepare --batch batch-1",
-            "awaiting-approval": "python scripts/mobile_release.py release --batch batch-1",
-            "partial-release": "python scripts/mobile_release.py release --batch batch-1",
-            "release-failed": "python scripts/mobile_release.py release --batch batch-1",
-            "released-builds-unverified": "python scripts/mobile_release.py status --batch batch-1",
+            "preflight-complete": "python3 scripts/mobile_release.py prepare --batch batch-1",
+            "dry-run-complete": "python3 scripts/mobile_release.py prepare --batch batch-1",
+            "awaiting-approval": "python3 scripts/mobile_release.py release --batch batch-1",
+            "partial-release": "python3 scripts/mobile_release.py release --batch batch-1",
+            "release-failed": "python3 scripts/mobile_release.py release --batch batch-1",
+            "released-builds-unverified": "python3 scripts/mobile_release.py status --batch batch-1",
         }
 
         for state, command in expected.items():
@@ -1226,13 +1226,38 @@ class InventoryTests(unittest.TestCase):
     def test_inventory_defines_the_three_managed_apps(self):
         inventory = load_inventory(SKILL_ROOT / "references/apps.json")
 
-        self.assertEqual(set(inventory.apps), {"pocket-manage", "installers", "partner"})
+        self.assertEqual(set(inventory.default_apps), {"pocket-manage", "installers", "partner"})
+        self.assertIn("go-measure", inventory.apps)
         for app in inventory.apps.values():
             self.assertEqual(app.dev_branch, "dev")
             self.assertEqual(app.staging_branch, "staging")
             self.assertEqual(app.release_branch, "release")
             self.assertEqual(app.submodule_path, "packages")
             self.assertEqual(app.submodule_branch, "main")
+
+    def test_app_overrides_replace_inventory_defaults(self):
+        data = json.loads((SKILL_ROOT / "references/apps.json").read_text())
+        data['apps']['pocket-manage'].update(dev_branch='integration', staging_checks=['App staging'],
+                                           codemagic_checks=['App production'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'apps.json'
+            path.write_text(json.dumps(data))
+            inventory = load_inventory(path)
+        app = inventory.apps['pocket-manage']
+        self.assertEqual(app.dev_branch, 'integration')
+        self.assertEqual(app.staging_checks, ['App staging'])
+        self.assertEqual(app.codemagic_checks, ['App production'])
+        self.assertEqual(inventory.apps['partner'].workflow, 'managed-release')
+
+    def test_cli_defaults_keep_original_pocket_batch(self):
+        inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+        with mock.patch.object(mobile_release, 'build_operator') as factory:
+            operator = factory.return_value
+            operator.inventory = inventory
+            operator.preflight.return_value = CliTests._batch('preflight-complete')
+            with mock.patch('sys.stdout', io.StringIO()):
+                self.assertEqual(mobile_release.main(['preflight', '--dry-run', '--json']), 0)
+            operator.preflight.assert_called_once_with(['pocket-manage', 'installers', 'partner'], dry_run=True)
 
     def test_batch_store_round_trips_without_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1519,7 +1544,7 @@ class PrepareTests(unittest.TestCase):
                 self.assertEqual(saved["state"], "prepare-failed")
                 self.assertIn(reason, saved["apps"]["pocket-manage"]["error"])
                 self.assertEqual(response["recovery"]["next_command"],
-                                 f"python scripts/mobile_release.py prepare --batch {batch['batch_id']}")
+                                 f"python3 scripts/mobile_release.py prepare --batch {batch['batch_id']}")
                 self.assertFalse(any(c.args[:2] == ("gh", "pr") for c in operator.runner.calls))
                 if failure != "push-rejected":
                     self.assertFalse(any(c.mutates for c in operator.runner.calls))
@@ -1560,9 +1585,10 @@ class PrepareTests(unittest.TestCase):
         operator, batch = prepared_operator()
         self.addCleanup(operator._test_temporary_directory.cleanup)
         record = batch["apps"]["pocket-manage"]
-        batch["selected_apps"] = list(operator.inventory.apps)
+        batch["selected_apps"] = list(operator.inventory.default_apps)
         batch["apps"] = {}
-        for key, app in operator.inventory.apps.items():
+        for key in operator.inventory.default_apps:
+            app = operator.inventory.apps[key]
             batch["apps"][key] = dict(record, repository=app.repository)
         operator.store.save(batch)
         result = operator.prepare(batch["batch_id"], dry_run=True)
