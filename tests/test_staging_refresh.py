@@ -207,10 +207,10 @@ class StagingRefreshTests(unittest.TestCase):
             staging_diagnosis={"missing": {"note": "no CodeMagic application matched"}},
         )
         batch["state"] = "awaiting-approval"
-        batch["selected_apps"] = list(operator.inventory.default_apps)
+        batch["selected_apps"] = ["pocket-manage", "installers", "partner"]
         batch["apps"] = {
             key: dict(copy.deepcopy(record), repository=app.repository)
-            for key, app in operator.inventory.apps.items() if key in operator.inventory.default_apps
+            for key, app in operator.inventory.apps.items() if key in batch["selected_apps"]
         }
         operator.store.save(batch)
         snapshot_count = len(operator.store.snapshots)

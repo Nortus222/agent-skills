@@ -141,10 +141,8 @@ class AppConfig:
     submodule_branch: str
     release_label: str
     release_manifest: str
-    workflow: str = "managed-release"
     staging_checks: tuple[str, ...] | None = None
     codemagic_checks: tuple[str, ...] | None = None
-    release_notes_file: str | None = None
     runbook: str | None = None
 
 
@@ -155,7 +153,6 @@ class Inventory:
     codemagic_checks: tuple[str, ...]
     staging_checks: tuple[str, ...]
     apps: dict[str, AppConfig]
-    default_apps: tuple[str, ...] = ()
 
 
 class BatchStore:
@@ -210,7 +207,6 @@ def load_inventory(path: Path) -> Inventory:
         codemagic_checks=tuple(data["codemagic_checks"]),
         staging_checks=tuple(data["staging_checks"]),
         apps=apps,
-        default_apps=tuple(data.get("default_apps", apps)),
     )
 
 
@@ -249,23 +245,26 @@ class ReleaseOperator:
 
     def preflight(
         self, app_keys: Sequence[str], dry_run: bool = False, *,
-        repository_path: Path | None = None, source_sha: str | None = None,
+        repository_path: Path | None = None,
     ) -> dict[str, Any]:
         selected_apps = list(app_keys)
         self._validate_selection(selected_apps)
-        if self.inventory.apps[selected_apps[0]].workflow == "pinned-staging":
-            return self._staging_deploy(selected_apps).preflight(
-                dry_run=dry_run, repository_path=repository_path, source_sha=source_sha
-            )
-        if repository_path is not None or source_sha is not None:
-            raise ReleaseError("--repository and --source require exactly one pinned-staging app")
+        if repository_path is not None and len(selected_apps) != 1:
+            raise ReleaseError("--repository requires exactly one explicitly selected app")
         self._run(
             ["gh", "auth", "status", "--hostname", "github.com"],
             repository="GitHub",
         )
 
-        workspace_root = self._workspace_root()
-        repositories = self._discover_repositories(workspace_root, selected_apps)
+        if repository_path is None:
+            repositories = self._discover_repositories(self._workspace_root(), selected_apps)
+        else:
+            path = repository_path.expanduser().resolve()
+            if not path.is_dir() or not (path / ".git").exists():
+                raise ReleaseError("--repository must name a Git checkout or worktree")
+            self._verify_repository_origin(self.inventory.apps[selected_apps[0]], path)
+            repositories = {selected_apps[0]: path}
+
         for app_key in selected_apps:
             self._verify_repository_permission(self.inventory.apps[app_key])
         for app_key in selected_apps:
@@ -298,14 +297,13 @@ class ReleaseOperator:
         """Update development pointers and merge each exact promotion PR.
 
         With [staging_only] the batch stops once staging carries the prepared
-        commit, so a TestFlight build can be proven before anything reaches the
+        commit, so a staging build can be proven before anything reaches the
         release branch. Resuming the same batch with a plain prepare promotes
         it; the bump is not repeated, because the completed preparation is
         still current.
         """
         batch = self.store.load(batch_id)
-        if self._batch_workflow(batch) == "pinned-staging":
-            return self._staging_deploy(batch["selected_apps"]).prepare(batch, dry_run=dry_run)
+        self._validate_batch(batch)
         if batch.get("state") not in {
             "preflight-complete",
             "prepare-in-progress",
@@ -433,8 +431,7 @@ class ReleaseOperator:
     def release(self, batch_id: str, dry_run: bool = False) -> dict[str, Any]:
         """Merge an unchanged approval snapshot and verify release build startup."""
         batch = self.store.load(batch_id)
-        if self._batch_workflow(batch) == "pinned-staging":
-            return self._staging_deploy(batch["selected_apps"]).release(batch, dry_run=dry_run)
+        self._validate_batch(batch)
         allowed_states = {
             "awaiting-approval",
             "partial-release",
@@ -610,8 +607,7 @@ class ReleaseOperator:
     def status(self, batch_id: str) -> dict[str, Any]:
         """Refresh staging observations without saving or changing remote state."""
         batch = self.store.load(batch_id)
-        if self._batch_workflow(batch) == "pinned-staging":
-            return self._staging_deploy(batch["selected_apps"]).status(batch)
+        self._validate_batch(batch)
         for app_key in batch["selected_apps"]:
             self._refresh_staging(self.inventory.apps[app_key], batch["apps"][app_key])
         return batch
@@ -1436,6 +1432,7 @@ class ReleaseOperator:
         dry_run: bool,
     ) -> None:
         repository_path = Path(app_record["repository_path"])
+        self._verify_repository_origin(app, repository_path)
         current_dev = self._remote_branch_sha(app, app.dev_branch, repository_path)
         if app_record["dev_push"] == "pushed":
             if current_dev != app_record["dev_sha"]:
@@ -1534,6 +1531,7 @@ class ReleaseOperator:
             current_dev = self._remote_branch_sha(app, app.dev_branch, repository_path)
             if current_dev != app_record["dev_sha"]:
                 raise ReleaseError(f"repository {app.repository}: origin/dev changed before push")
+            self._verify_repository_origin(app, worktree_path)
             push = self.runner.run(push_command, cwd=worktree_path, mutates=True)
             if push.returncode != 0:
                 stderr = self._redact(push.stderr.strip()) or "no stderr"
@@ -1577,6 +1575,7 @@ class ReleaseOperator:
     ) -> None:
         """Advance an existing staging branch to the prepared dev commit without merging."""
         repository_path = Path(app_record["repository_path"])
+        self._verify_repository_origin(app, repository_path)
         dev_ref = f"refs/remotes/origin/{app.dev_branch}"
         staging_ref = f"refs/remotes/origin/{app.staging_branch}"
         fetch = ["git", "fetch", "origin", _remote_tracking_refspec(app.dev_branch),
@@ -1625,6 +1624,7 @@ class ReleaseOperator:
             )
         if ancestry.returncode != 0:
             raise ReleaseError(self._command_error(app.repository, ancestry_command, ancestry))
+        self._verify_repository_origin(app, repository_path)
         self._run(
             ["git", "push", "origin", f"{dev_sha}:refs/heads/{app.staging_branch}"],
             cwd=repository_path, repository=app.repository, mutates=True,
@@ -1953,37 +1953,50 @@ class ReleaseOperator:
             raise ReleaseError(f"repository {app.repository}: invalid remote branch {branch}")
         return fields[0]
 
+    def _verify_repository_origin(self, app: AppConfig, repository_path: Path) -> None:
+        """Require the configured repository for both fetching and publication."""
+        origins = self._run(
+            ["git", "remote", "get-url", "--all", "origin"],
+            cwd=repository_path, repository=app.repository,
+        ).stdout.splitlines()
+        expected = _normalize_repository(app.repository)
+        if len(origins) != 1 or _normalize_repository(origins[0]) != expected:
+            raise ReleaseError(f"repository {app.repository}: origin does not match the configured repository")
+        push_urls = self._run(
+            ["git", "remote", "get-url", "--push", "--all", "origin"],
+            cwd=repository_path, repository=app.repository,
+        ).stdout.splitlines()
+        if len(push_urls) != 1:
+            raise ReleaseError(f"repository {app.repository}: origin requires exactly one effective push destination")
+        if _normalize_repository(push_urls[0]) != expected:
+            raise ReleaseError(f"repository {app.repository}: origin push destination does not match the configured repository")
+
     def _checks(self, app: AppConfig, *, staging: bool = False) -> Sequence[str]:
         override = app.staging_checks if staging else app.codemagic_checks
         return override if override is not None else (
             self.inventory.staging_checks if staging else self.inventory.codemagic_checks
         )
 
-    def _staging_deploy(self, app_keys: Sequence[str]):
-        from staging_deploy import StagingDeploy
-        return StagingDeploy(self, self.inventory.apps[app_keys[0]])
-
     def _routing_snapshot(self, app: AppConfig) -> dict[str, Any]:
+        # Retain the routing signature accepted by existing managed receipts.
         return {
-            "repository": app.repository, "workflow": app.workflow,
+            "repository": app.repository, "workflow": "managed-release",
             "dev_branch": app.dev_branch, "staging_branch": app.staging_branch,
             "release_branch": app.release_branch, "submodule_path": app.submodule_path,
             "submodule_branch": app.submodule_branch, "release_label": app.release_label,
-            "release_manifest": app.release_manifest, "release_notes_file": app.release_notes_file,
+            "release_manifest": app.release_manifest, "release_notes_file": None,
             "staging_checks": list(self._checks(app, staging=True)),
             "codemagic_checks": list(self._checks(app)),
         }
 
-    def _batch_workflow(self, batch: dict[str, Any]) -> str:
+    def _validate_batch(self, batch: dict[str, Any]) -> None:
         try:
             self._validate_selection(batch["selected_apps"])
         except ReleaseError as error:
             raise ReleaseError(f"saved batch configuration is invalid: {error}") from error
-        configured = self.inventory.apps[batch["selected_apps"][0]].workflow
-        # Old batches always used the managed-release policy.
         saved = batch.get("workflow", "managed-release")
-        if saved != configured:
-            raise ReleaseError("saved batch workflow differs from inventory; create a new batch")
+        if saved != "managed-release":
+            raise ReleaseError(f"saved {saved} workflow is unsupported; create a new explicit-app batch")
         for key in batch["selected_apps"]:
             record = batch['apps'][key]
             repository = record.get('repository')
@@ -1992,9 +2005,6 @@ class ReleaseOperator:
             routing = record.get('routing')
             if routing is not None and routing != self._routing_snapshot(self.inventory.apps[key]):
                 raise ReleaseError("saved batch routing differs from inventory; create a new batch")
-            if saved == "pinned-staging" and routing is None:
-                raise ReleaseError("saved batch lacks pinned-staging routing; create a new batch")
-        return saved
 
     def _validate_selection(self, app_keys: list[str]) -> None:
         if not app_keys:
@@ -2004,18 +2014,6 @@ class ReleaseOperator:
         unknown = [app_key for app_key in app_keys if app_key not in self.inventory.apps]
         if unknown:
             raise ReleaseError(f"unknown application: {', '.join(unknown)}")
-        policies = {self.inventory.apps[key].workflow for key in app_keys}
-        if policies - {"managed-release", "pinned-staging"}:
-            raise ReleaseError("unknown deployment workflow in inventory")
-        if len(policies) > 1:
-            raise ReleaseError("mixed deployment workflows require separate batches; select Pocket apps or a pinned-staging app")
-        if policies == {"pinned-staging"}:
-            for key in app_keys:
-                app = self.inventory.apps[key]
-                if len({app.dev_branch, app.staging_branch, app.release_branch}) != 3:
-                    raise ReleaseError("pinned-staging requires distinct dev, staging, and release branches")
-        if policies == {"pinned-staging"} and len(app_keys) != 1:
-            raise ReleaseError("pinned-staging currently requires one app per batch; use separate batches")
 
     def _workspace_root(self) -> Path:
         configured = self.environ.get(
@@ -2073,6 +2071,7 @@ class ReleaseOperator:
             )
 
     def _preflight_app(self, app: AppConfig, repository_path: Path) -> dict[str, Any]:
+        self._verify_repository_origin(app, repository_path)
         self._run(
             [
                 "git",
@@ -2426,7 +2425,7 @@ def approval_rows(batch: dict[str, Any]) -> list[dict[str, Any]]:
                 "checks": app.get("release_pr_checks", [{"name": name, **check} for name, check in app.get("codemagic_checks", {}).items()]),
                 "base": app.get("release_pr_base"),
                 "labels": app.get("release_pr_labels", []),
-                "head_sha": app.get("release_pr_head_sha", app.get("candidate_sha", app.get("source_sha"))),
+                "head_sha": app.get("release_pr_head_sha"),
                 "staging_sha": app.get("staging_sha"),
                 "staging_checks": app.get("staging_checks", {}),
                 "staging_missing_checks": app.get("staging_missing_checks", []),

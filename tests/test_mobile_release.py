@@ -4,9 +4,10 @@ import io
 import json
 import sys
 import tempfile
+import subprocess
 import unittest
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +22,7 @@ from mobile_release_lib import (
     PollPolicy,
     ReleaseError,
     ReleaseOperator,
+    SubprocessRunner,
     approval_rows,
     load_inventory,
     new_batch,
@@ -29,6 +31,39 @@ from mobile_release_lib import (
 
 
 class CliTests(unittest.TestCase):
+    def test_failed_preflight_retry_keeps_explicit_selection_and_inspection_mode(self):
+        import shlex
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.inventory.apps = {"go-measure": object()}
+            operator.preflight.side_effect = ReleaseError("origin push destination changed")
+            args = ["preflight", "--app", "go-measure", "--repository", "/tmp/task worktree", "--git-auth", "gh", "--dry-run", "--json"]
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                self.assertEqual(mobile_release.main(args), 1)
+            retry = json.loads(stdout.getvalue())["recovery"]["next_command"]
+            self.assertEqual(shlex.split(retry), ["python3", "scripts/mobile_release.py", *args])
+
+    def test_successful_dry_run_retry_keeps_explicit_repository(self):
+        import shlex
+        with mock.patch.object(mobile_release, "build_operator") as factory:
+            operator = factory.return_value
+            operator.inventory.apps = {"go-measure": object()}
+            operator.preflight.return_value = self._batch("preflight-complete")
+            stdout = io.StringIO()
+            args = ["preflight", "--app", "go-measure", "--repository", "/tmp/task worktree", "--git-auth", "gh", "--dry-run", "--json"]
+            with mock.patch("sys.stdout", stdout):
+                self.assertEqual(mobile_release.main(args), 0)
+            retry = json.loads(stdout.getvalue())["next_command"]
+            self.assertEqual(shlex.split(retry), ["python3", "scripts/mobile_release.py", *[arg for arg in args if arg != "--dry-run"]])
+
+    def test_preflight_requires_explicit_apps_before_operator_construction(self):
+        with mock.patch.object(mobile_release, "build_operator") as factory, mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                mobile_release.main(["preflight", "--json"])
+        self.assertEqual(raised.exception.code, 2)
+        factory.assert_not_called()
+
     @staticmethod
     def _batch(state="awaiting-approval"):
         return {
@@ -66,7 +101,7 @@ class CliTests(unittest.TestCase):
                 "batch-1", dry_run=True, staging_only=False
             )
 
-    def test_preflight_json_defaults_to_all_configured_apps(self):
+    def test_preflight_json_uses_explicit_multiple_apps(self):
         with mock.patch.object(mobile_release, "build_operator") as factory:
             operator = factory.return_value
             operator.inventory.apps = {"pocket-manage": object(), "partner": object()}
@@ -74,7 +109,7 @@ class CliTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with mock.patch("sys.stdout", stdout):
-                result = mobile_release.main(["preflight", "--dry-run", "--json"])
+                result = mobile_release.main(["preflight", "--app", "pocket-manage", "--app", "partner", "--dry-run", "--json"])
 
         self.assertEqual(result, 0)
         operator.preflight.assert_called_once_with(
@@ -84,7 +119,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(document["batch_id"], "batch-1")
         self.assertEqual(
             document["next_command"],
-            "python3 scripts/mobile_release.py preflight --json",
+            "python3 scripts/mobile_release.py preflight --app pocket-manage --app partner --json",
         )
         self.assertIn("dry-run preflight was not saved", document["warnings"])
 
@@ -149,7 +184,7 @@ class CliTests(unittest.TestCase):
             "python3 scripts/mobile_release.py release --batch batch-1",
         )
 
-    def test_preflight_json_error_has_null_recovery_without_a_saved_batch(self):
+    def test_preflight_json_error_keeps_explicit_retry_without_a_saved_batch(self):
         with mock.patch.object(mobile_release, "build_operator") as factory:
             operator = factory.return_value
             operator.inventory.apps = {"pocket-manage": object()}
@@ -157,13 +192,13 @@ class CliTests(unittest.TestCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-                result = mobile_release.main(["preflight", "--json"])
+                result = mobile_release.main(["preflight", "--app", "pocket-manage", "--json"])
 
         self.assertEqual(result, 1)
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(
             json.loads(stdout.getvalue()),
-            {"error": "authentication failed", "recovery": None},
+            {"error": "authentication failed", "recovery": {"next_command": "python3 scripts/mobile_release.py preflight --app pocket-manage --json"}},
         )
 
     def test_next_commands_match_the_skill_invocation(self):
@@ -294,6 +329,11 @@ class FakeRunner:
 
     def run(self, args, *, cwd=None, mutates=False):
         self.calls.append(RecordedCall(tuple(args), cwd, mutates))
+        if tuple(args) in {("git", "remote", "get-url", "--all", "origin"),
+                           ("git", "remote", "get-url", "--push", "--all", "origin")} and cwd.name != "packages":
+            inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+            app = next(app for app in inventory.apps.values() if app.directory == cwd.name)
+            return CommandResult(0, f"git@github.com:{app.repository}.git\n", "")
         if not self.responses:
             raise AssertionError(f"unexpected command: {args}")
         return self.responses.popleft()
@@ -333,6 +373,8 @@ class PreparationRunner:
         lockfile_changed=True,
     ):
         self.calls = []
+        self.repository = "MarketplaceSoftware/pocketmanage"
+        self.push_urls = None
         self.tracks_lockfile = tracks_lockfile
         self.lockfile_changed = lockfile_changed
         self.existing_pr = existing_pr
@@ -363,6 +405,13 @@ class PreparationRunner:
     def run(self, args, *, cwd=None, mutates=False):
         self.calls.append(RecordedCall(tuple(args), cwd, mutates))
         command = tuple(args)
+        if command in {("git", "remote", "get-url", "--all", "origin"),
+                       ("git", "remote", "get-url", "--push", "--all", "origin")}:
+            inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+            matched = next((app for app in inventory.apps.values() if app.directory == cwd.name), None)
+            repository = matched.repository if matched else self.repository
+            urls = self.push_urls if "--push" in command and self.push_urls is not None else [f"git@github.com:{repository}.git"]
+            return CommandResult(0, "\n".join(urls), "")
 
         if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/staging"):
             if self.staging_failure == "missing":
@@ -474,7 +523,7 @@ class PreparationRunner:
                     [
                         {
                             "number": 42,
-                            "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/42",
+                            "url": f"https://github.com/{self.repository}/pull/42",
                             "headRefOid": "a" * 40,
                             "baseRefName": "release",
                             "labels": [{"name": "autorelease: pending"}],
@@ -490,7 +539,7 @@ class PreparationRunner:
                 pull_requests.append(
                     {
                         "number": 17,
-                        "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/17",
+                        "url": f"https://github.com/{self.repository}/pull/17",
                         "headRefName": "staging",
                         "headRefOid": self.remote_dev,
                         "baseRefName": "release",
@@ -500,7 +549,7 @@ class PreparationRunner:
                 pull_requests.append(
                     {
                         "number": 18,
-                        "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/18",
+                        "url": f"https://github.com/{self.repository}/pull/18",
                         "headRefName": "staging",
                         "headRefOid": self.remote_dev,
                         "baseRefName": "release",
@@ -510,7 +559,7 @@ class PreparationRunner:
         if command[:3] == ("gh", "pr", "create"):
             return CommandResult(
                 0,
-                "https://github.com/MarketplaceSoftware/pocketmanage/pull/17\n",
+                f"https://github.com/{self.repository}/pull/17\n",
                 "",
             )
         if command[:3] == ("gh", "pr", "checks"):
@@ -560,7 +609,7 @@ class PreparationRunner:
                 json.dumps(
                     {
                         "number": 17,
-                        "url": "https://github.com/MarketplaceSoftware/pocketmanage/pull/17",
+                        "url": f"https://github.com/{self.repository}/pull/17",
                         "state": state,
                         "mergedAt": "2026-08-14T13:00:00Z" if self.resumed else None,
                         "mergeable": mergeable,
@@ -579,7 +628,9 @@ class PreparationRunner:
             return CommandResult(0, "", "")
         if command[:2] == ("gh", "api"):
             if command[2].endswith("/check-runs"):
-                names = load_inventory(SKILL_ROOT / "references/apps.json").staging_checks
+                inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+                app = next(app for app in inventory.apps.values() if f"repos/{app.repository}/" in command[2])
+                names = app.staging_checks or inventory.staging_checks
                 return CommandResult(
                     0,
                     json.dumps({"check_runs": [
@@ -618,6 +669,7 @@ class DiscoveryRunner:
             "MarketplaceSoftware/pocketmanage": "2.7.0",
             "MarketplaceSoftware/pocketmanage_installers": "1.3.0",
             "MarketplaceSoftware/pocketmanage_partner": "4.2.1",
+                "MarketplaceSoftware/go_measure": "1.2.0",
         }
 
     def run(self, args, *, cwd=None, mutates=False):
@@ -744,6 +796,7 @@ class ReleaseRunner:
             "MarketplaceSoftware/pocketmanage": "4" * 40,
             "MarketplaceSoftware/pocketmanage_installers": "5" * 40,
             "MarketplaceSoftware/pocketmanage_partner": "6" * 40,
+            "MarketplaceSoftware/go_measure": "9" * 40,
         }
 
     def run(self, args, *, cwd=None, mutates=False):
@@ -810,6 +863,7 @@ class ReleaseRunner:
                 else "2.7.0",
                 "MarketplaceSoftware/pocketmanage_installers": "1.3.0",
                 "MarketplaceSoftware/pocketmanage_partner": "4.2.1",
+                "MarketplaceSoftware/go_measure": "1.2.0",
             }[repository]
             content = base64.b64encode(json.dumps({".": version}).encode()).decode()
             return CommandResult(
@@ -868,9 +922,9 @@ class ReleaseRunner:
         if command[:2] == ("gh", "api") and "/check-runs" in command[2]:
             check_runs = []
             if self.codemagic_checks != "timeout":
-                names = load_inventory(
-                    SKILL_ROOT / "references/apps.json"
-                ).codemagic_checks
+                inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+                app = next(app for app in inventory.apps.values() if app.repository == repository)
+                names = app.codemagic_checks or inventory.codemagic_checks
                 returned_names = (
                     names[:1] if self.codemagic_checks == "partial-timeout" else names
                 )
@@ -997,7 +1051,7 @@ def awaiting_approval_operator(
     operator._test_temporary_directory = temporary
     batch = new_batch(app_keys, now="2026-08-14T12:00:00Z")
     batch["state"] = "partial-release" if resumed_merge else "awaiting-approval"
-    versions = {"pocket-manage": "2.7.0", "installers": "1.3.0", "partner": "4.2.1"}
+    versions = {"pocket-manage": "2.7.0", "installers": "1.3.0", "partner": "4.2.1", "go-measure": "1.2.0"}
     for index, app_key in enumerate(app_keys, start=42):
         app = inventory.apps[app_key]
         if app_key in skipped_apps:
@@ -1069,11 +1123,12 @@ def prepared_operator(
     resumed=False,
     tracks_lockfile=False,
     lockfile_changed=True,
+    app_key=None,
 ):
     temporary = tempfile.TemporaryDirectory()
     root = Path(temporary.name) / "workspace"
-    app_key = "partner" if no_dev_release_diff else "pocket-manage"
-    directory = "pocketmanage_partner" if app_key == "partner" else "pocketmanage"
+    app_key = app_key or ("partner" if no_dev_release_diff else "pocket-manage")
+    directory = load_inventory(SKILL_ROOT / "references/apps.json").apps[app_key].directory
     repository_path = root / directory
     (repository_path / ".git").mkdir(parents=True)
     (repository_path / "packages").mkdir()
@@ -1102,6 +1157,7 @@ def prepared_operator(
         tracks_lockfile=tracks_lockfile,
         lockfile_changed=lockfile_changed,
     )
+    runner.repository = f"MarketplaceSoftware/{directory}"
     store = RecordingBatchStore(Path(temporary.name) / "state")
     operator = ReleaseOperator(
         load_inventory(SKILL_ROOT / "references/apps.json"),
@@ -1163,20 +1219,29 @@ CODEMAGIC_YAML = "\n".join(
 )
 
 
-def successful_preflight_responses(app_count=3):
+def successful_preflight_responses(app_count=3, app_keys=None):
     responses = [CommandResult(0, "github.com\n", "")]
     repositories = (
         "MarketplaceSoftware/pocketmanage",
         "MarketplaceSoftware/pocketmanage_installers",
         "MarketplaceSoftware/pocketmanage_partner",
     )
+    inventory = load_inventory(SKILL_ROOT / "references/apps.json")
+    if app_keys:
+        app_count = len(app_keys)
+        repositories = tuple(app.repository for app in sorted(
+            [inventory.apps[key] for key in app_keys], key=lambda app: app.directory
+        ))
     responses.extend(CommandResult(0, f"git@github.com:{repository}.git\n", "") for repository in repositories)
     responses.extend(
         CommandResult(0, json.dumps({"viewerPermission": "WRITE"}), "")
         for _ in range(app_count)
     )
     responses.extend(CommandResult(0, "", "") for _ in range(app_count))
-    for _ in range(app_count):
+    for app_key in app_keys or ["pocket-manage", "installers", "partner"][:app_count]:
+        app = inventory.apps[app_key]
+        names = [*(app.staging_checks or inventory.staging_checks), *(app.codemagic_checks or inventory.codemagic_checks)]
+        yaml = "workflows:\n" + "".join(f"  workflow-{index}:\n    name: {name}\n" for index, name in enumerate(names))
         responses.extend(
             [
                 CommandResult(0, "", ""),
@@ -1186,10 +1251,10 @@ def successful_preflight_responses(app_count=3):
                 CommandResult(0, "", ""),
                 CommandResult(0, f"{'f' * 40}\n", ""),
                 CommandResult(0, "{}\n{}\n", ""),
-                CommandResult(0, CODEMAGIC_YAML, ""),
+                CommandResult(0, yaml, ""),
                 # Preflight reads codemagic.yaml twice: release for the release
                 # workflows, dev for the staging ones.
-                CommandResult(0, CODEMAGIC_YAML, ""),
+                CommandResult(0, yaml, ""),
                 CommandResult(0, "[]\n", ""),
                 CommandResult(0, "", ""),
             ]
@@ -1197,11 +1262,12 @@ def successful_preflight_responses(app_count=3):
     return responses
 
 
-def make_operator(fake_responses, *, duplicate_remote=False, environment=None):
+def make_operator(fake_responses, *, duplicate_remote=False, environment=None, app_keys=None):
     temporary = tempfile.TemporaryDirectory()
     root = Path(temporary.name) / "workspace"
     root.mkdir()
-    for name in ("pocketmanage", "pocketmanage_installers", "pocketmanage_partner"):
+    names = ("pocketmanage", "pocketmanage_installers", "pocketmanage_partner") if app_keys is None else [load_inventory(SKILL_ROOT / "references/apps.json").apps[key].directory for key in app_keys]
+    for name in names:
         repository = root / name
         (repository / ".git").mkdir(parents=True)
         (repository / "packages").mkdir()
@@ -1223,10 +1289,10 @@ def make_operator(fake_responses, *, duplicate_remote=False, environment=None):
 
 
 class InventoryTests(unittest.TestCase):
-    def test_inventory_defines_the_three_managed_apps(self):
+    def test_inventory_defines_four_apps_with_explicit_checks(self):
         inventory = load_inventory(SKILL_ROOT / "references/apps.json")
 
-        self.assertEqual(set(inventory.default_apps), {"pocket-manage", "installers", "partner"})
+        self.assertEqual(set(inventory.apps), {"pocket-manage", "installers", "partner", "go-measure"})
         self.assertIn("go-measure", inventory.apps)
         for app in inventory.apps.values():
             self.assertEqual(app.dev_branch, "dev")
@@ -1234,6 +1300,8 @@ class InventoryTests(unittest.TestCase):
             self.assertEqual(app.release_branch, "release")
             self.assertEqual(app.submodule_path, "packages")
             self.assertEqual(app.submodule_branch, "main")
+            self.assertIsNotNone(app.staging_checks)
+            self.assertIsNotNone(app.codemagic_checks)
 
     def test_app_overrides_replace_inventory_defaults(self):
         data = json.loads((SKILL_ROOT / "references/apps.json").read_text())
@@ -1247,17 +1315,7 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(app.dev_branch, 'integration')
         self.assertEqual(app.staging_checks, ['App staging'])
         self.assertEqual(app.codemagic_checks, ['App production'])
-        self.assertEqual(inventory.apps['partner'].workflow, 'managed-release')
-
-    def test_cli_defaults_keep_original_pocket_batch(self):
-        inventory = load_inventory(SKILL_ROOT / "references/apps.json")
-        with mock.patch.object(mobile_release, 'build_operator') as factory:
-            operator = factory.return_value
-            operator.inventory = inventory
-            operator.preflight.return_value = CliTests._batch('preflight-complete')
-            with mock.patch('sys.stdout', io.StringIO()):
-                self.assertEqual(mobile_release.main(['preflight', '--dry-run', '--json']), 0)
-            operator.preflight.assert_called_once_with(['pocket-manage', 'installers', 'partner'], dry_run=True)
+        self.assertEqual(inventory.apps['partner'].dev_branch, 'dev')
 
     def test_batch_store_round_trips_without_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1279,6 +1337,61 @@ class InventoryTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_explicit_go_checkout_uses_shared_preflight_and_packages_head(self):
+        keys = ["go-measure"]
+        responses = successful_preflight_responses(app_keys=keys)
+        del responses[1]
+        operator = make_operator(responses, app_keys=keys)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        path = Path(operator._test_temporary_directory.name) / "workspace/go_measure"
+        batch = operator.preflight(keys, repository_path=path)
+        self.assertEqual(batch["apps"]["go-measure"]["packages_pointer_sha"], "c" * 40)
+        self.assertEqual(batch["apps"]["go-measure"]["packages_sha"], "f" * 40)
+        self.assertEqual(batch["apps"]["go-measure"]["branches"], ["dev", "staging", "release"])
+        self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_mixed_go_pocket_preflight_snapshots_one_common_batch(self):
+        keys = ["go-measure", "pocket-manage"]
+        operator = make_operator(successful_preflight_responses(app_keys=keys), app_keys=keys)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        batch = operator.preflight(keys)
+        self.assertEqual(batch["selected_apps"], keys)
+        self.assertEqual(batch["workflow"], "managed-release")
+        self.assertEqual(batch["apps"]["go-measure"]["packages_sha"], "f" * 40)
+        self.assertEqual(batch["apps"]["pocket-manage"]["packages_sha"], "f" * 40)
+
+    def test_explicit_checkout_rejects_real_git_pushurl_to_another_bare_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "task"
+            other = root / "other.git"
+            for command in (["git", "init", str(repo)], ["git", "init", "--bare", str(other)],
+                            ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:MarketplaceSoftware/go_measure.git"],
+                            ["git", "-C", str(repo), "config", "remote.origin.pushurl", str(other)]):
+                subprocess.run(command, check=True, capture_output=True)
+            runner = SubprocessRunner()
+            original = runner.run
+            calls = []
+            def run(args, **kwargs):
+                calls.append(list(args))
+                if args[:2] == ["gh", "auth"]:
+                    return CommandResult(0, "", "")
+                return original(args, **kwargs)
+            runner.run = run
+            operator = ReleaseOperator(load_inventory(SKILL_ROOT / "references/apps.json"), BatchStore(root / "state"), runner=runner)
+            with self.assertRaisesRegex(ReleaseError, "push destination"):
+                operator.preflight(["go-measure"], repository_path=repo)
+            self.assertFalse(any(command[:2] in (["git", "push"], ["git", "fetch"]) for command in calls))
+            self.assertEqual(subprocess.check_output(["git", "-C", str(other), "for-each-ref"], text=True), "")
+            self.assertFalse(operator.store.root.exists())
+
+    def test_repository_option_requires_single_app_before_commands(self):
+        operator = make_operator([])
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        with self.assertRaisesRegex(ReleaseError, "exactly one"):
+            operator.preflight(["pocket-manage", "go-measure"], repository_path=Path("unused"))
+        self.assertEqual(operator.runner.calls, [])
+
     def test_preflight_rejects_a_repository_without_write_permission(self):
         responses = successful_preflight_responses()
         responses[5] = CommandResult(
@@ -1523,6 +1636,90 @@ class PreflightTests(unittest.TestCase):
 
 
 class PrepareTests(unittest.TestCase):
+    def test_go_measure_updates_packages_and_uses_shared_promotions(self):
+        operator, batch = prepared_operator(app_key="go-measure", tracks_lockfile=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        result = operator.prepare(batch["batch_id"])
+        app = result["apps"]["go-measure"]
+        self.assertEqual(result["state"], "awaiting-approval")
+        self.assertEqual(app["submodule_before"], "c" * 40)
+        self.assertEqual(app["submodule_after"], "f" * 40)
+        self.assertEqual(app["submodule_sha"], "f" * 40)
+        self.assertEqual(set(app["staging_checks"]), {"Android internal testing", "iOS external TestFlight", "Firebase staging"})
+        calls = command_args(operator.runner.calls)
+        self.assertIn(["flutter", "pub", "get"], calls)
+        self.assertIn(["git", "push", "origin", "HEAD:dev"], calls)
+        self.assertIn(["git", "push", "origin", "1" * 40 + ":refs/heads/staging"], calls)
+        promotion = next(command for command in calls if command[:3] == ["gh", "pr", "create"])
+        self.assertEqual(promotion[promotion.index("--repo") + 1], "MarketplaceSoftware/go_measure")
+        self.assertEqual(promotion[promotion.index("--head") + 1], "staging")
+        self.assertEqual(promotion[promotion.index("--base") + 1], "release")
+        merge = next(command for command in calls if command[:3] == ["gh", "pr", "merge"])
+        self.assertIn("--admin", merge)
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], "1" * 40)
+
+    def test_shared_prepare_rejects_wrong_or_multiple_push_destinations(self):
+        for urls in (["git@github.com:Example/other.git"],
+                     ["git@github.com:MarketplaceSoftware/go_measure.git"] * 2):
+            with self.subTest(urls=urls):
+                operator, batch = prepared_operator(app_key="go-measure")
+                self.addCleanup(operator._test_temporary_directory.cleanup)
+                operator.runner.push_urls = urls
+                with self.assertRaisesRegex(ReleaseError, "push destination"):
+                    operator.prepare(batch["batch_id"])
+                self.assertFalse(any(call.mutates for call in operator.runner.calls))
+
+    def test_go_origin_change_after_dev_push_blocks_staging_and_resumes_without_rebump(self):
+        operator, batch = prepared_operator(app_key="go-measure")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        original = operator.runner.run
+        def run(args, **kwargs):
+            result = original(args, **kwargs)
+            if args == ["git", "push", "origin", "HEAD:dev"]:
+                operator.runner.push_urls = ["git@github.com:Example/wrong.git"]
+            return result
+        operator.runner.run = run
+        with self.assertRaisesRegex(ReleaseError, "push destination"):
+            operator.prepare(batch["batch_id"])
+        saved = operator.store.load(batch["batch_id"])
+        self.assertEqual(saved["apps"]["go-measure"]["dev_push"], "pushed")
+        self.assertFalse(saved["apps"]["go-measure"].get("staging_sha"))
+        operator.runner.push_urls = None
+        result = operator.prepare(batch["batch_id"])
+        self.assertEqual(result["state"], "awaiting-approval")
+        self.assertEqual(sum(call.args == ("git", "push", "origin", "HEAD:dev") for call in operator.runner.calls), 1)
+
+    def test_existing_managed_routing_signature_remains_readable(self):
+        operator, batch = prepared_operator()
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        record = batch["apps"]["pocket-manage"]
+        batch["workflow"] = "managed-release"
+        record["routing"] = {
+            "repository": "MarketplaceSoftware/pocketmanage", "workflow": "managed-release",
+            "dev_branch": "dev", "staging_branch": "staging", "release_branch": "release",
+            "submodule_path": "packages", "submodule_branch": "main", "release_label": "autorelease: pending",
+            "release_manifest": ".release-please-manifest.json", "release_notes_file": None,
+            "staging_checks": ["Build IPA and Publish To TestFlight (Staging)", "Build Android AppBundle and Publish to Internal Testing"],
+            "codemagic_checks": ["Build Android AppBundle and Publish", "Build IPA and Publish To AppStore Connect", "Build Web and Publish to Firebase Hosting"],
+        }
+        operator.store.save(batch)
+        self.assertEqual(operator.status(batch["batch_id"]), batch)
+        self.assertEqual(operator.runner.calls, [])
+        operator.inventory.apps['pocket-manage'] = replace(operator.inventory.apps['pocket-manage'], staging_branch='preview')
+        with self.assertRaisesRegex(ReleaseError, "saved batch routing"):
+            operator.prepare(batch['batch_id'])
+        self.assertEqual(operator.runner.calls, [])
+
+    def test_old_pinned_receipts_are_rejected_for_every_command(self):
+        operator, batch = prepared_operator(app_key="go-measure")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        batch["workflow"] = "pinned-staging"
+        operator.store.save(batch)
+        for command in (operator.prepare, operator.release, operator.status):
+            with self.subTest(command=command.__name__), self.assertRaisesRegex(ReleaseError, "pinned-staging.*unsupported"):
+                command(batch["batch_id"])
+        self.assertEqual(operator.runner.calls, [])
+
     def test_staging_failures_save_state_and_print_resume_without_promotion(self):
         for failure, reason in [("missing", "missing prerequisite origin/staging"),
                                 ("diverged", "origin/staging has diverged"),
@@ -1585,11 +1782,14 @@ class PrepareTests(unittest.TestCase):
         operator, batch = prepared_operator()
         self.addCleanup(operator._test_temporary_directory.cleanup)
         record = batch["apps"]["pocket-manage"]
-        batch["selected_apps"] = list(operator.inventory.default_apps)
+        batch["selected_apps"] = ["pocket-manage", "installers", "partner"]
         batch["apps"] = {}
-        for key in operator.inventory.default_apps:
+        for key in batch["selected_apps"]:
             app = operator.inventory.apps[key]
-            batch["apps"][key] = dict(record, repository=app.repository)
+            path = Path(record["repository_path"]).parent / app.directory
+            (path / ".git").mkdir(parents=True, exist_ok=True)
+            (path / "packages").mkdir(exist_ok=True)
+            batch["apps"][key] = dict(record, repository=app.repository, repository_path=str(path))
         operator.store.save(batch)
         result = operator.prepare(batch["batch_id"], dry_run=True)
         for app in result["apps"].values():
@@ -2205,6 +2405,36 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_mixed_go_and_pocket_release_uses_one_guarded_batch(self):
+        operator, batch = awaiting_approval_operator(app_keys=["go-measure", "pocket-manage"])
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        result = operator.release(batch["batch_id"])
+        self.assertEqual(result["state"], "released")
+        go = result["apps"]["go-measure"]
+        self.assertEqual(go["tag"], "v1.2.0")
+        self.assertEqual(go["tag_commit_sha"], "9" * 40)
+        self.assertEqual(set(go["codemagic_checks"]), {"Android production", "iOS App Store", "Firebase production"})
+        pocket = result["apps"]["pocket-manage"]
+        self.assertEqual(set(pocket["codemagic_checks"]), set(operator.inventory.codemagic_checks))
+        self.assertEqual(operator.runner.successful_merges, ["MarketplaceSoftware/go_measure", "MarketplaceSoftware/pocketmanage"])
+        for call in operator.runner.calls:
+            if call.args[:3] == ("gh", "pr", "merge"):
+                self.assertIn("--admin", call.args)
+                self.assertEqual(call.args[call.args.index("--match-head-commit") + 1], "a" * 40)
+
+    def test_go_build_recovery_observes_production_tag_without_remerging(self):
+        operator, batch = awaiting_approval_operator(app_keys=["go-measure"], codemagic_checks="timeout")
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        released = operator.release(batch["batch_id"])
+        self.assertEqual(released["state"], "released-builds-unverified")
+        before = operator.store.load(batch["batch_id"])
+        operator.runner.codemagic_checks = "queued"
+        observed = mobile_release._observe_status(operator, batch["batch_id"])
+        self.assertEqual(observed["state"], "released")
+        self.assertEqual(observed["apps"]["go-measure"]["tag_commit_sha"], "9" * 40)
+        self.assertEqual(before, operator.store.load(batch["batch_id"]))
+        self.assertEqual(operator.runner.successful_merges, ["MarketplaceSoftware/go_measure"])
+
     def test_release_dry_run_and_execution_use_the_same_guarded_merge_command(self):
         dry_operator, dry_batch = awaiting_approval_operator()
         live_operator, live_batch = awaiting_approval_operator()

@@ -1,4 +1,4 @@
 interface:
   display_name: "Deploy Mobile Apps"
   short_description: "Deploy Pocket Manage and GO Measure safely"
-  default_prompt: "Use $deploy-mobile-apps to select an app and prepare its authorized deployment."
+  default_prompt: "Use $deploy-mobile-apps to explicitly select the requested apps and run the shared deployment workflow."
