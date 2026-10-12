@@ -45,14 +45,25 @@ configured app. Otherwise, preflight discovers the selected repositories under
 the configured workspace root. Report the partial-batch warning before preparing
 fewer than all inventoried apps.
 
-`prepare` bumps the submodule on `dev`, fast-forwards the existing `staging` branch
-to that commit, then promotes `staging` to `release`. The staging push starts each app's configured testing workflows. GO Measure uses
+`prepare` updates the packages pointer on `dev`, publishes that prepared source
+to staging, and promotes staging to release. It fast-forwards staging when
+possible. When staging has only extra promotion history, it creates a normal
+merge that preserves that history and requires the resulting files to equal the
+prepared dev source. Separate staging content, conflicting changes, or moved
+source/target refs stop preparation. No force push is used.
+
+The staging push starts each app's configured testing workflows. GO Measure uses
 Play internal testing, external TestFlight, and Firebase staging; report the check
-names and destinations from that app's inventory and publishing runbook. When an app commits `pubspec.lock`, the bump runs `flutter pub get`
-and commits the regenerated lockfile with the pointer, so `flutter` must be on `PATH`.
-Land the staging CI changes and create protected staging
-branches with their webhooks before running a real `prepare`. A dry run only plans
-these steps; it does not verify those prerequisites or start builds.
+names and destinations from the app's inventory and publishing runbook. When an
+app tracks `pubspec.lock`, the packages bump runs `flutter pub get` and commits
+the refreshed lockfile, so `flutter` must be on `PATH`.
+
+Preflight validates Release Please and both staging/production workflows in the
+incoming dev source. The current release branch is snapshotted for promotion
+checks; it need not already contain the new publishing configuration. Staging
+must exist, its protection rules and webhooks must be ready, and the deployment
+worktree directory must be ignored. A dry run does not publish or prove store
+readiness.
 
 Add `--staging-only` to stop once staging carries the prepared commit, so a
 TestFlight build proves the change before any of it reaches `release`:
@@ -113,7 +124,8 @@ run still counts as detected. Do not wait for the builds to finish.
 | `no releasable changes` | Show `unreleased_commits` and get the skip approved before `release`. |
 | `partial-release` | Name merged and remaining apps, then resume the same batch with `release` only after reporting the failure. |
 | No build observed | Report `released-builds-unverified`, tag and commit URLs, and the unobserved checks. A queued build registers no check run, so this is not evidence that nothing is building. Resume observation with `status`. |
-| Diverged `staging` | Report the saved failure and resume command. A human must investigate direct staging pushes before retrying; never merge or force-push staging. |
+| Staging promotion history | Preserve it with a normal promotion merge whose tree equals prepared dev. Report the actual staging SHA. |
+| Separate staging content or moved refs | Stop and report the saved failure, receipt, preserved worktree, and safe next command. Inspect before resuming; never reset or force-push staging. |
 | Missing `staging` | Report the missing prerequisite and saved resume command. Land staging CI and configure the branch, protection rules, and webhooks before retrying. |
 | Preserved worktree | Report its path and leave it untouched. |
 
@@ -133,6 +145,9 @@ state, warnings, and the printed safe resume command.
 
 `status` refreshes staging checks, missing checks, failed checks, and diagnosis for
 each saved staging SHA. It leaves the saved batch and remote state unchanged.
+Staging publication saves its candidate and previous target before pushing. If a
+push response is lost, reconcile that receipt and observe the saved candidate;
+do not create another promotion just to obtain a publishing response.
 
 For SSH authentication failures such as `Permission denied (publickey)`, the error
 includes recovery advice even when preflight has not saved a batch. Load the

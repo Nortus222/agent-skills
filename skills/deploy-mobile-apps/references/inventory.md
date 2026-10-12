@@ -18,13 +18,16 @@ batch; there is no default selection. A single app can use `--repository <path>`
 for a specific checkout. Otherwise the workspace setting discovers sibling
 repositories by origin URL.
 
-Before enabling an app, verify its existing staging branch can fast-forward to
-the prepared dev source, its staging and release workflows exist, and the packages
-checkout is usable. Its release branch must contain Release Please configuration
-and the production workflows before the shared preflight can pass.
-The deployment worktree directory must be ignored by that repository. Diverged
-staging requires review and reconciliation before deployment; keep the shared
-branch guards in place.
+Before enabling an app, verify its staging branch exists, the incoming dev source
+contains Release Please configuration and all configured staging/production
+workflows, and the packages checkout is usable. The current release branch must
+exist; incoming configuration can reach it through the normal promotion.
+
+The deployment worktree directory must be ignored. Staging can fast-forward or
+have extra promotion history with the same content as its shared ancestor with
+dev. The publisher preserves that history and checks its candidate against the
+prepared dev tree. Separate staging content requires review; keep the shared
+source, target, and tree guards in place.
 
 Run regressions from the repository root:
 

@@ -43,7 +43,7 @@ class StepRecorder(ReleaseOperator):
         self.calls.append("bump")
         app_record["dev_sha"] = "d" * 40
 
-    def _fast_forward_staging(self, batch, app, app_record, *, dry_run):
+    def _publish_staging(self, batch, app, app_record, *, dry_run):
         self.calls.append("fast-forward")
         app_record["staging_sha"] = "d" * 40
 

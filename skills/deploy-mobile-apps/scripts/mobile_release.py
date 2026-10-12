@@ -97,6 +97,11 @@ def _next_command(batch: dict[str, Any]) -> str | None:
     if not batch_id:
         return None
     state = batch.get("state")
+    if any(
+        record.get("staging_push") == "outcome-unverified" or record.get("staging_recovery") == "status-only"
+        for record in batch.get("apps", {}).values()
+    ):
+        return f"{COMMAND_PREFIX} status --batch {batch_id}"
     if state in {
         "preflight-complete",
         "prepare-failed",
@@ -121,8 +126,9 @@ def _batch_warnings(batch: dict[str, Any]) -> list[str]:
         app = batch.get("apps", {}).get(app_key, {})
         if app.get("error"):
             warnings.append(f"{app_key}: {app['error']}")
-        if app.get("worktree"):
-            warnings.append(f"{app_key}: preserved worktree {app['worktree']}")
+        for field in ("worktree", "staging_worktree"):
+            if app.get(field):
+                warnings.append(f"{app_key}: preserved worktree {app[field]}")
     if batch.get("state") == "released-builds-unverified":
         warnings.append(
             "no CodeMagic build was observed yet; a queued build registers no check run"

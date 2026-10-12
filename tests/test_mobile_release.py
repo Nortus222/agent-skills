@@ -413,6 +413,18 @@ class PreparationRunner:
             urls = self.push_urls if "--push" in command and self.push_urls is not None else [f"git@github.com:{repository}.git"]
             return CommandResult(0, "\n".join(urls), "")
 
+        if command == ("git", "rev-parse", "refs/remotes/origin/staging^{commit}"):
+            return CommandResult(0, self.remote_staging, "")
+        if command[:2] == ("git", "rev-parse") and command[-1].endswith("^{tree}"):
+            sha = command[-1].removesuffix("^{tree}")
+            tree = "b" * 40 if self.staging_failure == "diverged" and sha == self.remote_staging else "a" * 40
+            return CommandResult(0, tree, "")
+        if command[:2] == ("git", "merge-base") and "--is-ancestor" not in command:
+            return CommandResult(0, "c" * 40, "")
+        if command[:3] == ("git", "merge-base", "--is-ancestor") and not any(arg.startswith("refs/") for arg in command[3:]):
+            return CommandResult(0, "", "")
+        if command[:2] == ("git", "ls-tree") and "--name-only" not in command:
+            return CommandResult(0, f"160000 commit {'f' * 40}\tpackages", "")
         if command == ("git", "ls-remote", "--exit-code", "origin", "refs/heads/staging"):
             if self.staging_failure == "missing":
                 return CommandResult(2, "", "")
@@ -456,7 +468,7 @@ class PreparationRunner:
                 return CommandResult(128, "", "fatal: Not a valid commit name")
             is_ancestor = self.release_contains_dev or self.remote_dev == self.remote_release
             return CommandResult(0 if is_ancestor else 1, "", "")
-        if command == ("git", "check-ignore", "-q", ".claude/worktrees"):
+        if command == ("git", "check-ignore", "-q", ".claude/worktrees/"):
             return CommandResult(0, "", "")
         if command[:3] == ("git", "worktree", "add"):
             return CommandResult(0, "", "")
@@ -1250,10 +1262,8 @@ def successful_preflight_responses(app_count=3, app_keys=None):
                 CommandResult(0, "git@github.com:MarketplaceSoftware/packages.git\n", ""),
                 CommandResult(0, "", ""),
                 CommandResult(0, f"{'f' * 40}\n", ""),
-                CommandResult(0, "{}\n{}\n", ""),
-                CommandResult(0, yaml, ""),
-                # Preflight reads codemagic.yaml twice: release for the release
-                # workflows, dev for the staging ones.
+                CommandResult(0, '{".": "1.1.0"}', ""),
+                CommandResult(0, '{"release-type": "simple", "packages": {".": {}}}', ""),
                 CommandResult(0, yaml, ""),
                 CommandResult(0, "[]\n", ""),
                 CommandResult(0, "", ""),
@@ -1460,7 +1470,7 @@ class PreflightTests(unittest.TestCase):
 
         self.assertFalse(
             any(
-                call.args == ("git", "check-ignore", "-q", ".claude/worktrees")
+                call.args == ("git", "check-ignore", "-q", ".claude/worktrees/")
                 for call in operator.runner.calls
             )
         )
@@ -1563,7 +1573,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_rejects_workflow_names_found_only_in_nested_fields(self):
         responses = successful_preflight_responses(app_count=1)
-        responses[13] = CommandResult(
+        responses[14] = CommandResult(
             0,
             "\n".join(
                 [
@@ -1584,7 +1594,7 @@ class PreflightTests(unittest.TestCase):
         operator = make_operator(responses)
         self.addCleanup(operator._test_temporary_directory.cleanup)
 
-        with self.assertRaisesRegex(ReleaseError, "missing workflow names"):
+        with self.assertRaisesRegex(ReleaseError, "missing production workflow names"):
             operator.preflight(["pocket-manage"])
 
         self.assertEqual(list(operator.store.root.glob("*.json")), [])
@@ -1689,6 +1699,15 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(result["state"], "awaiting-approval")
         self.assertEqual(sum(call.args == ("git", "push", "origin", "HEAD:dev") for call in operator.runner.calls), 1)
 
+    def test_restored_checkout_clears_status_only_before_completed_preparation(self):
+        operator, batch = prepared_operator(resumed=True)
+        self.addCleanup(operator._test_temporary_directory.cleanup)
+        batch["apps"]["pocket-manage"]["staging_recovery"] = "status-only"
+        operator.store.save(batch)
+        result = operator.prepare(batch["batch_id"])
+        self.assertNotIn("staging_recovery", result["apps"]["pocket-manage"])
+        self.assertFalse(any(call.args[:2] == ("git", "push") or call.args[:3] == ("gh", "pr", "merge") for call in operator.runner.calls))
+
     def test_existing_managed_routing_signature_remains_readable(self):
         operator, batch = prepared_operator()
         self.addCleanup(operator._test_temporary_directory.cleanup)
@@ -1728,6 +1747,8 @@ class PrepareTests(unittest.TestCase):
                 operator, batch = prepared_operator(submodule_changed=False)
                 self.addCleanup(operator._test_temporary_directory.cleanup)
                 operator.runner.staging_failure = failure
+                if failure == "push-rejected":
+                    operator.runner.remote_staging = "b" * 40
                 output = io.StringIO()
                 with mock.patch.object(mobile_release, "build_operator", return_value=operator):
                     with mock.patch("sys.stdout", output):

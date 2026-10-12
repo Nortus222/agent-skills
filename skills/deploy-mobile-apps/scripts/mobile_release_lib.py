@@ -319,17 +319,18 @@ class ReleaseOperator:
             app_record = batch["apps"][app_key]
             self._initialize_preparation_record(app_record)
             try:
+                if app_record.get("staging_sha"):
+                    self._staging_checkout(app, app_record)
                 if self._completed_preparation_is_current(app, app_record):
                     if not dry_run:
                         self._refresh_staging(app, app_record)
                     continue
-                self._prepare_development_pointer(
-                    batch,
-                    app,
-                    app_record,
-                    dry_run=dry_run,
+                staging_recorded = app_record.get("staging_push_attempted") or (
+                    app_record.get("staging_push") in {"pushed", "unchanged"} and app_record.get("staging_sha")
                 )
-                self._fast_forward_staging(batch, app, app_record, dry_run=dry_run)
+                if not staging_recorded:
+                    self._prepare_development_pointer(batch, app, app_record, dry_run=dry_run)
+                self._publish_staging(batch, app, app_record, dry_run=dry_run)
                 if staging_only:
                     if not dry_run:
                         self._verify_staging(batch, app, app_record)
@@ -1565,7 +1566,22 @@ class ReleaseOperator:
             )
             app_record["worktree"] = None
 
-    def _fast_forward_staging(
+    def _staging_checkout(self, app: AppConfig, app_record: dict[str, Any]) -> Path:
+        """Preserve observation-only recovery when a staged checkout disappears."""
+        path = Path(app_record["repository_path"])
+        if path.is_dir():
+            app_record.pop("staging_recovery", None)
+            return path
+        if app_record.get("staging_sha"):
+            app_record["staging_recovery"] = "status-only"
+            self._refresh_staging(app, app_record)
+            raise ReleaseError(
+                f"repository {app.repository}: saved checkout is unavailable; "
+                "observe the saved staging candidate with status only; restore the checkout before preparation or promotion"
+            )
+        raise ReleaseError(f"repository {app.repository}: saved checkout is unavailable; restore it before preparation")
+
+    def _publish_staging(
         self,
         batch: dict[str, Any],
         app: AppConfig,
@@ -1573,32 +1589,32 @@ class ReleaseOperator:
         *,
         dry_run: bool,
     ) -> None:
-        """Advance an existing staging branch to the prepared dev commit without merging."""
-        repository_path = Path(app_record["repository_path"])
-        self._verify_repository_origin(app, repository_path)
+        """Publish an exact prepared tree while preserving existing staging history."""
+        path = self._staging_checkout(app, app_record)
+        self._verify_repository_origin(app, path)
         dev_ref = f"refs/remotes/origin/{app.dev_branch}"
         staging_ref = f"refs/remotes/origin/{app.staging_branch}"
-        fetch = ["git", "fetch", "origin", _remote_tracking_refspec(app.dev_branch),
-                 _remote_tracking_refspec(app.staging_branch)]
+        fetch = [
+            "git",
+            "fetch",
+            "origin",
+            _remote_tracking_refspec(app.dev_branch),
+            _remote_tracking_refspec(app.staging_branch),
+        ]
         ancestry_command = ["git", "merge-base", "--is-ancestor", staging_ref, dev_ref]
-        app_record["branches"] = [app.dev_branch, app.staging_branch, app.release_branch]
-        if dry_run:
-            # A planned bump has no commit SHA until prepare actually creates it.
-            planned_sha = (
-                "<prepared-dev-sha>" if app_record["dev_push"] == "planned"
-                else app_record["dev_sha"]
-            )
-            app_record["planned_staging_sha"] = planned_sha
-            app_record["staging_push"] = "planned"
-            app_record["planned_commands"].extend([
-                fetch, ancestry_command,
-                ["git", "push", "origin", f"{planned_sha}:refs/heads/{app.staging_branch}"],
-            ])
-            return
-
-        command = ["git", "ls-remote", "--exit-code", "origin",
-                   f"refs/heads/{app.staging_branch}"]
-        remote = self.runner.run(command, cwd=repository_path, mutates=False)
+        app_record["branches"] = [
+            app.dev_branch,
+            app.staging_branch,
+            app.release_branch,
+        ]
+        command = [
+            "git",
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            f"refs/heads/{app.staging_branch}",
+        ]
+        remote = self.runner.run(command, cwd=path, mutates=False)
         if remote.returncode == 2:
             raise ReleaseError(
                 f"repository {app.repository}: missing prerequisite origin/{app.staging_branch}; "
@@ -1606,32 +1622,300 @@ class ReleaseOperator:
             )
         if remote.returncode != 0:
             raise ReleaseError(self._command_error(app.repository, command, remote))
-        self._run(fetch, cwd=repository_path, repository=app.repository)
-        dev_sha = self._run(
-            ["git", "rev-parse", f"{dev_ref}^{{commit}}"],
-            cwd=repository_path, repository=app.repository,
+        self._run(fetch, cwd=path, repository=app.repository)
+        stage = self._run(
+            ["git", "rev-parse", f"{staging_ref}^{{commit}}"],
+            cwd=path,
+            repository=app.repository,
         ).stdout.strip()
-        if dev_sha != app_record["dev_sha"]:
+        source = app_record["dev_sha"]
+        candidate = app_record.get("staging_candidate_sha")
+
+        if dry_run:
+            current_source = self._run(
+                ["git", "rev-parse", f"{dev_ref}^{{commit}}"],
+                cwd=path,
+                repository=app.repository,
+            ).stdout.strip()
+            if current_source != source:
+                raise ReleaseError(
+                    f"repository {app.repository}: origin/{app.dev_branch} changed before staging push"
+                )
+            recorded = (
+                candidate
+                if app_record.get("staging_push_attempted")
+                else (
+                    app_record.get("staging_sha")
+                    if app_record.get("staging_push") in {"pushed", "unchanged"}
+                    else None
+                )
+            )
+            if recorded:
+                if stage != recorded:
+                    raise ReleaseError(
+                        f"repository {app.repository}: staging push outcome is unverified or staging advanced; observe the saved candidate with status"
+                    )
+                app_record.update(planned_staging_sha=recorded, staging_plan="existing")
+                return
+            if candidate:
+                if (
+                    stage != app_record["staging_before_sha"]
+                    or source != app_record["staging_source_sha"]
+                ):
+                    raise ReleaseError(
+                        f"repository {app.repository}: source or staging changed before staging push"
+                    )
+                app_record["planned_staging_sha"] = candidate
+                app_record["planned_commands"].append(
+                    [
+                        "git",
+                        "push",
+                        "origin",
+                        f"{candidate}:refs/heads/{app.staging_branch}",
+                    ]
+                )
+                return
+            kind = self._staging_promotion_kind(
+                app, path, stage, source, ancestry_command
+            )
+            prepared_source = (
+                "<prepared-dev-sha>" if app_record["dev_push"] == "planned" else source
+            )
+            if kind == "existing" and app_record["dev_push"] == "planned":
+                kind = "merge"
+            app_record["planned_commands"].extend([fetch, ancestry_command])
+            planned_sha = stage if kind == "existing" else prepared_source
+            if kind == "merge":
+                worktree = (
+                    path
+                    / ".claude"
+                    / "worktrees"
+                    / f"{batch['batch_id']}-{app.key}-staging"
+                )
+                branch = f"deploy-mobile-apps/{batch['batch_id']}/{app.key}-staging"
+                self._verify_deployment_worktree_is_ignored(app, path)
+                app_record["planned_commands"].extend(
+                    [
+                        ["git", "worktree", "add", "-b", branch, str(worktree), stage],
+                        [
+                            "git",
+                            "merge",
+                            "--no-ff",
+                            prepared_source,
+                            "-m",
+                            "Promote prepared development to staging",
+                        ],
+                    ]
+                )
+                planned_sha = "<staging-promotion-sha>"
+            app_record.update(
+                planned_staging_sha=planned_sha,
+                staging_push="planned",
+                staging_plan=kind,
+            )
+            if planned_sha != stage:
+                app_record["planned_commands"].append(
+                    [
+                        "git",
+                        "push",
+                        "origin",
+                        f"{planned_sha}:refs/heads/{app.staging_branch}",
+                    ]
+                )
+            return
+
+        if app_record.get("staging_push_attempted"):
+            app_record["staging_sha"] = candidate
+            if stage == candidate or self._is_ancestor(app, path, candidate, stage):
+                app_record["staging_push"] = "pushed"
+                self.store.save(batch)
+                return
+            app_record["staging_push"] = "outcome-unverified"
+            self.store.save(batch)
+            self._refresh_staging(app, app_record)
+            raise ReleaseError(
+                f"repository {app.repository}: staging push outcome is unverified; "
+                "observe the saved candidate with status; this batch will not push again"
+            )
+        if app_record.get("staging_push") in {"pushed", "unchanged"} and app_record.get(
+            "staging_sha"
+        ):
+            return
+
+        current_source = self._run(
+            ["git", "rev-parse", f"{dev_ref}^{{commit}}"],
+            cwd=path,
+            repository=app.repository,
+        ).stdout.strip()
+        if current_source != source:
             raise ReleaseError(
                 f"repository {app.repository}: origin/{app.dev_branch} changed before staging push"
             )
-        ancestry = self.runner.run(ancestry_command, cwd=repository_path, mutates=False)
-        if ancestry.returncode == 1:
-            raise ReleaseError(
-                f"repository {app.repository}: origin/{app.staging_branch} has diverged from "
-                f"origin/{app.dev_branch}; a human must investigate direct staging pushes "
-                "before resuming; staging will not be merged or force-pushed"
+        if app_record.get("staging_before_sha"):
+            if (
+                stage != app_record["staging_before_sha"]
+                or source != app_record["staging_source_sha"]
+            ):
+                raise ReleaseError(
+                    f"repository {app.repository}: source or staging changed before staging push"
+                )
+        else:
+            app_record.update(staging_before_sha=stage, staging_source_sha=source)
+        if not candidate:
+            kind = self._staging_promotion_kind(
+                app, path, stage, source, ancestry_command
             )
-        if ancestry.returncode != 0:
-            raise ReleaseError(self._command_error(app.repository, ancestry_command, ancestry))
-        self._verify_repository_origin(app, repository_path)
+            if kind == "fast-forward":
+                candidate = source
+            elif kind == "existing":
+                candidate = stage
+            else:
+                self._verify_deployment_worktree_is_ignored(app, path)
+                worktree = (
+                    path
+                    / ".claude"
+                    / "worktrees"
+                    / f"{batch['batch_id']}-{app.key}-staging"
+                )
+                branch = f"deploy-mobile-apps/{batch['batch_id']}/{app.key}-staging"
+                app_record.update(
+                    staging_worktree=str(worktree), staging_promotion_branch=branch
+                )
+                self.store.save(batch)
+                self._run(
+                    ["git", "worktree", "add", "-b", branch, str(worktree), stage],
+                    cwd=path,
+                    repository=app.repository,
+                    mutates=True,
+                )
+                self._run(
+                    [
+                        "git",
+                        "merge",
+                        "--no-ff",
+                        source,
+                        "-m",
+                        "Promote prepared development to staging",
+                    ],
+                    cwd=worktree,
+                    repository=app.repository,
+                    mutates=True,
+                )
+                candidate = self._run(
+                    ["git", "rev-parse", "HEAD^{commit}"],
+                    cwd=worktree,
+                    repository=app.repository,
+                ).stdout.strip()
+                if self._run(
+                    ["git", "status", "--porcelain"],
+                    cwd=worktree,
+                    repository=app.repository,
+                ).stdout.strip():
+                    raise ReleaseError(
+                        f"repository {app.repository}: staging promotion worktree is dirty; inspect it before continuing"
+                    )
+            app_record["staging_candidate_sha"] = candidate
+            self.store.save(batch)
+
+        if self._commit_tree(app, path, candidate) != self._commit_tree(
+            app, path, source
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: staging candidate tree differs from prepared dev"
+            )
+        pointer = self._run(
+            ["git", "ls-tree", candidate, "--", app.submodule_path],
+            cwd=path,
+            repository=app.repository,
+        ).stdout.strip()
+        if (
+            pointer
+            != f"160000 commit {app_record['submodule_after']}\t{app.submodule_path}"
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: staging candidate packages pointer differs from prepared packages"
+            )
+        if not self._is_ancestor(
+            app, path, app_record["staging_before_sha"], candidate
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: staging candidate does not preserve previous staging history"
+            )
+        if not self._is_ancestor(app, path, source, candidate):
+            raise ReleaseError(
+                f"repository {app.repository}: staging candidate does not preserve prepared development history"
+            )
+        self._verify_repository_origin(app, path)
+        if self._remote_branch_sha(app, app.dev_branch, path) != source:
+            raise ReleaseError(
+                f"repository {app.repository}: origin/{app.dev_branch} changed before staging push"
+            )
+        if (
+            self._remote_branch_sha(app, app.staging_branch, path)
+            != app_record["staging_before_sha"]
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: origin/{app.staging_branch} changed before staging push"
+            )
+        app_record["staging_sha"] = candidate
+        if candidate == stage:
+            app_record["staging_push"] = "unchanged"
+            self.store.save(batch)
+            return
+        app_record.update(staging_push_attempted=True, staging_push="in-progress")
+        self.store.save(batch)
         self._run(
-            ["git", "push", "origin", f"{dev_sha}:refs/heads/{app.staging_branch}"],
-            cwd=repository_path, repository=app.repository, mutates=True,
+            ["git", "push", "origin", f"{candidate}:refs/heads/{app.staging_branch}"],
+            cwd=path,
+            repository=app.repository,
+            mutates=True,
         )
-        app_record["staging_sha"] = dev_sha
         app_record["staging_push"] = "pushed"
         self.store.save(batch)
+
+    def _staging_promotion_kind(
+        self,
+        app: AppConfig,
+        path: Path,
+        stage: str,
+        source: str,
+        ancestry_command: Sequence[str],
+    ) -> str:
+        ancestry = self.runner.run(ancestry_command, cwd=path, mutates=False)
+        if ancestry.returncode not in {0, 1}:
+            raise ReleaseError(
+                self._command_error(app.repository, ancestry_command, ancestry)
+            )
+        if ancestry.returncode == 0:
+            return "fast-forward"
+        base = self._run(
+            ["git", "merge-base", stage, source], cwd=path, repository=app.repository
+        ).stdout.strip()
+        stage_tree = self._commit_tree(app, path, stage)
+        if stage_tree != self._commit_tree(app, path, base):
+            raise ReleaseError(
+                f"repository {app.repository}: origin/{app.staging_branch} has diverged "
+                "with staging-only content; inspect the saved source and target before a new batch"
+            )
+        if self._is_ancestor(
+            app, path, source, stage
+        ) and stage_tree == self._commit_tree(app, path, source):
+            return "existing"
+        return "merge"
+
+    def _commit_tree(self, app: AppConfig, path: Path, sha: str) -> str:
+        return self._run(
+            ["git", "rev-parse", f"{sha}^{{tree}}"], cwd=path, repository=app.repository
+        ).stdout.strip()
+
+    def _is_ancestor(
+        self, app: AppConfig, path: Path, ancestor: str, descendant: str
+    ) -> bool:
+        command = ["git", "merge-base", "--is-ancestor", ancestor, descendant]
+        result = self.runner.run(command, cwd=path, mutates=False)
+        if result.returncode not in {0, 1}:
+            raise ReleaseError(self._command_error(app.repository, command, result))
+        return result.returncode == 0
 
     def _promote_development(
         self,
@@ -1652,6 +1936,9 @@ class ReleaseOperator:
             ])
             app_record["status"] = "planned"
             return
+        self._verify_repository_origin(app, repository_path)
+        if self._remote_branch_sha(app, app.dev_branch, repository_path) != app_record["dev_sha"]:
+            raise ReleaseError(f"repository {app.repository}: origin/{app.dev_branch} changed before production promotion")
         staging_ref = f"refs/remotes/origin/{app.staging_branch}"
         release_ref = f"refs/remotes/origin/{app.release_branch}"
         self._run(
@@ -1820,6 +2107,10 @@ class ReleaseOperator:
 
         # PR checks may have waited for the staging builds to finish.
         self._check_staging_before_promotion(batch, app, app_record)
+        if self._remote_branch_sha(app, app.dev_branch, repository_path) != app_record["dev_sha"]:
+            raise ReleaseError(f"repository {app.repository}: origin/{app.dev_branch} changed before production promotion")
+        if self._remote_branch_sha(app, app.staging_branch, repository_path) != staging_sha:
+            raise ReleaseError(f"repository {app.repository}: origin/{app.staging_branch} changed before production promotion")
         self._run(
             _guarded_merge_command(
                 app.repository,
@@ -2156,48 +2447,66 @@ class ReleaseOperator:
                 f"repository {app.repository}: missing configured submodule branch {app.submodule_branch}"
             )
 
-        self._run(
-            [
-                "git",
-                "show",
-                f"{release_sha}:{app.release_manifest}",
-                f"{release_sha}:release-please-config.json",
-            ],
-            cwd=repository_path,
+        manifest = self._load_json(
+            self._run(
+                ["git", "show", f"{dev_sha}:{app.release_manifest}"],
+                cwd=repository_path,
+                repository=app.repository,
+            ).stdout,
             repository=app.repository,
+            subject="incoming release manifest",
         )
-        release_codemagic = self._run(
-            ["git", "show", f"{release_sha}:codemagic.yaml"],
-            cwd=repository_path,
-            repository=app.repository,
-        ).stdout
-        self._reject_unusable_codemagic(app, app.release_branch, release_codemagic)
-        workflow_names = _codemagic_workflow_names(release_codemagic)
-        missing_workflows = [
-            name for name in self._checks(app) if name not in workflow_names
-        ]
-        if missing_workflows:
+        if (
+            not isinstance(manifest, dict)
+            or not isinstance(manifest.get("."), str)
+            or not manifest["."].strip()
+        ):
             raise ReleaseError(
-                f"repository {app.repository}: missing workflow names: {', '.join(missing_workflows)}"
+                f"repository {app.repository}: incoming release manifest requires a root package version"
             )
-
-        # Staging workflows are validated against dev, not release: they reach the
-        # release branch only once a promotion carries them there.
-        dev_codemagic = self._run(
+        release_config = self._load_json(
+            self._run(
+                ["git", "show", f"{dev_sha}:release-please-config.json"],
+                cwd=repository_path,
+                repository=app.repository,
+            ).stdout,
+            repository=app.repository,
+            subject="incoming Release Please configuration",
+        )
+        packages = (
+            release_config.get("packages") if isinstance(release_config, dict) else None
+        )
+        root_package = packages.get(".") if isinstance(packages, dict) else None
+        release_type = (
+            root_package.get("release-type", release_config.get("release-type"))
+            if isinstance(root_package, dict)
+            else None
+        )
+        if (
+            not isinstance(root_package, dict)
+            or not isinstance(release_type, str)
+            or not release_type.strip()
+        ):
+            raise ReleaseError(
+                f"repository {app.repository}: incoming Release Please configuration requires a root package and release type"
+            )
+        incoming_codemagic = self._run(
             ["git", "show", f"{dev_sha}:codemagic.yaml"],
             cwd=repository_path,
             repository=app.repository,
         ).stdout
-        self._reject_unusable_codemagic(app, app.dev_branch, dev_codemagic)
-        dev_workflow_names = _codemagic_workflow_names(dev_codemagic)
-        missing_staging = [
-            name for name in self._checks(app, staging=True) if name not in dev_workflow_names
-        ]
-        if missing_staging:
-            raise ReleaseError(
-                f"repository {app.repository}: missing staging workflow names on "
-                f"{app.dev_branch}: {', '.join(missing_staging)}"
-            )
+        self._reject_unusable_codemagic(app, app.dev_branch, incoming_codemagic)
+        workflow_names = _codemagic_workflow_names(incoming_codemagic)
+        for channel, names in (
+            ("production", self._checks(app)),
+            ("staging", self._checks(app, staging=True)),
+        ):
+            missing = [name for name in names if name not in workflow_names]
+            if missing:
+                raise ReleaseError(
+                    f"repository {app.repository}: missing {channel} workflow names on "
+                    f"{app.dev_branch}: {', '.join(missing)}"
+                )
 
         pull_requests = self._load_json(
             self._run(
@@ -2234,6 +2543,7 @@ class ReleaseOperator:
             "repository_path": str(repository_path),
             "branches": [app.dev_branch, app.staging_branch, app.release_branch],
             "dev_sha": dev_sha,
+            "configuration_source_sha": dev_sha,
             "release_sha": release_sha,
             "packages_pointer_sha": match.group(1),
             "packages_sha": packages_sha,
@@ -2365,7 +2675,7 @@ class ReleaseOperator:
     ) -> None:
         """Preparation adds .claude/worktrees inside the checkout; it must stay untracked."""
         result = self.runner.run(
-            ["git", "check-ignore", "-q", ".claude/worktrees"], cwd=repository_path
+            ["git", "check-ignore", "-q", ".claude/worktrees/"], cwd=repository_path
         )
         if result.returncode != 0:
             raise ReleaseError(
