@@ -1,6 +1,7 @@
 ---
 name: deploy-mobile-apps
-description: "Use when asked to deploy or release an inventoried app, including Pocket Manage and GO Measure, or inspect its deployment status."
+description: "Deploy or release explicitly selected apps, including Pocket Manage and GO Measure, and inspect deployment status."
+disable-model-invocation: true
 ---
 
 # Deploy apps
