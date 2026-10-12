@@ -24,7 +24,7 @@ from mobile_release_lib import (
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY_PATH = SKILL_ROOT / "references" / "apps.json"
 DEFAULT_STATE_ROOT = Path("~/.local/state/deploy-mobile-apps").expanduser()
-COMMAND_PREFIX = "python scripts/mobile_release.py"
+COMMAND_PREFIX = "python3 scripts/mobile_release.py"
 
 
 class _DiscardingStore:
@@ -54,10 +54,12 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "--app",
         action="append",
+        required=True,
         dest="apps",
         metavar="KEY",
-        help="select an app; repeat for multiple apps (default: all)",
+        help="explicitly select an app; repeat for multiple apps",
     )
+    preflight.add_argument("--repository", type=Path, help="explicit checkout for exactly one selected app; origin is verified")
     preflight.add_argument("--dry-run", action="store_true")
     preflight.add_argument("--json", action="store_true", dest="as_json")
 
@@ -95,6 +97,11 @@ def _next_command(batch: dict[str, Any]) -> str | None:
     if not batch_id:
         return None
     state = batch.get("state")
+    if any(
+        record.get("staging_push") == "outcome-unverified" or record.get("staging_recovery") == "status-only"
+        for record in batch.get("apps", {}).values()
+    ):
+        return f"{COMMAND_PREFIX} status --batch {batch_id}"
     if state in {
         "preflight-complete",
         "prepare-failed",
@@ -119,8 +126,9 @@ def _batch_warnings(batch: dict[str, Any]) -> list[str]:
         app = batch.get("apps", {}).get(app_key, {})
         if app.get("error"):
             warnings.append(f"{app_key}: {app['error']}")
-        if app.get("worktree"):
-            warnings.append(f"{app_key}: preserved worktree {app['worktree']}")
+        for field in ("worktree", "staging_worktree"):
+            if app.get(field):
+                warnings.append(f"{app_key}: preserved worktree {app[field]}")
     if batch.get("state") == "released-builds-unverified":
         warnings.append(
             "no CodeMagic build was observed yet; a queued build registers no check run"
@@ -244,6 +252,20 @@ def _print_result(
         _print_human(batch, warnings, next_command_override=next_command_override)
 
 
+def _preflight_command(args: argparse.Namespace, *, preserve_dry_run: bool = False) -> str:
+    """Retain explicit selection and authentication options in preflight recovery."""
+    command = [*shlex.split(COMMAND_PREFIX), "preflight"]
+    for key in args.apps or []:
+        command += ["--app", key]
+    if args.repository is not None:
+        command += ["--repository", str(args.repository)]
+    if args.git_auth != "default":
+        command += ["--git-auth", args.git_auth]
+    if preserve_dry_run and args.dry_run:
+        command += ["--dry-run"]
+    return shlex.join([*command, "--json"])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     operator = build_operator(git_auth=args.git_auth)
@@ -253,26 +275,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "preflight":
-            selected_apps = args.apps or list(operator.inventory.apps)
+            selected_apps = args.apps
             if len(selected_apps) < len(operator.inventory.apps):
                 warning = "partial batch: fewer than all configured apps are selected"
                 warnings.append(warning)
                 print(f"Warning: {warning}", file=sys.stderr, flush=True)
-            batch = operator.preflight(selected_apps, dry_run=args.dry_run)
+            options = {}
+            if args.repository is not None:
+                options["repository_path"] = args.repository
+            batch = operator.preflight(selected_apps, dry_run=args.dry_run, **options)
             if args.dry_run:
                 warnings.append("dry-run preflight was not saved")
-                next_command_override = f"{COMMAND_PREFIX} preflight --json"
+                next_command_override = _preflight_command(args)
         elif args.command == "prepare":
             if args.staging_only:
                 warnings.append(
-                    "staging-only: prepare pushes dev to staging, starting TestFlight "
-                    "internal dev-group and Play internal-track builds, and stops "
-                    "without promoting to release"
+                    "staging-only: prepare pushes prepared dev to staging, starts configured "
+                    "staging builds, and stops before promotion to release"
                 )
             else:
                 warnings.append(
-                    "prepare pushes dev to staging, starting TestFlight internal dev-group "
-                    "and Play internal-track builds before staging-to-release promotion"
+                    "prepare pushes prepared dev to staging and starts configured "
+                    "staging builds before promotion to release"
                 )
             if args.dry_run:
                 warnings.append(
@@ -304,15 +328,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 saved = operator.store.load(recovery_batch)
             except (OSError, ValueError, ReleaseError):
                 saved = None
+        retry = (
+            _preflight_command(args, preserve_dry_run=True)
+            if saved is None and args.command == "preflight" else None
+        )
         if args.as_json:
             recovery = _summary_document(saved) if saved is not None else None
             if error.recovery:
                 recovery = {**(recovery or {}), **error.recovery}
+            if retry:
+                recovery = {**(recovery or {}), "next_command": retry}
             print(json.dumps({"error": str(error), "recovery": recovery}, sort_keys=True))
         else:
             print(f"Release failed: {error}", file=sys.stderr)
             if saved is not None:
                 _print_human(saved, stream=sys.stderr)
+            elif retry:
+                print(f"Next command: {retry}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

@@ -11,9 +11,64 @@
     "Build Android AppBundle and Publish to Internal Testing"
   ],
   "apps": {
-    "pocket-manage": {"display_name": "Pocket Manage", "repository": "MarketplaceSoftware/pocketmanage", "directory": "pocketmanage"},
-    "installers": {"display_name": "Pocket Manage Installers", "repository": "MarketplaceSoftware/pocketmanage_installers", "directory": "pocketmanage_installers"},
-    "partner": {"display_name": "Pocket Manage Partner", "repository": "MarketplaceSoftware/pocketmanage_partner", "directory": "pocketmanage_partner"}
+    "pocket-manage": {
+      "display_name": "Pocket Manage",
+      "repository": "MarketplaceSoftware/pocketmanage",
+      "directory": "pocketmanage",
+      "staging_checks": [
+        "Build IPA and Publish To TestFlight (Staging)",
+        "Build Android AppBundle and Publish to Internal Testing"
+      ],
+      "codemagic_checks": [
+        "Build Android AppBundle and Publish",
+        "Build IPA and Publish To AppStore Connect",
+        "Build Web and Publish to Firebase Hosting"
+      ]
+    },
+    "installers": {
+      "display_name": "Pocket Manage Installers",
+      "repository": "MarketplaceSoftware/pocketmanage_installers",
+      "directory": "pocketmanage_installers",
+      "staging_checks": [
+        "Build IPA and Publish To TestFlight (Staging)",
+        "Build Android AppBundle and Publish to Internal Testing"
+      ],
+      "codemagic_checks": [
+        "Build Android AppBundle and Publish",
+        "Build IPA and Publish To AppStore Connect",
+        "Build Web and Publish to Firebase Hosting"
+      ]
+    },
+    "partner": {
+      "display_name": "Pocket Manage Partner",
+      "repository": "MarketplaceSoftware/pocketmanage_partner",
+      "directory": "pocketmanage_partner",
+      "staging_checks": [
+        "Build IPA and Publish To TestFlight (Staging)",
+        "Build Android AppBundle and Publish to Internal Testing"
+      ],
+      "codemagic_checks": [
+        "Build Android AppBundle and Publish",
+        "Build IPA and Publish To AppStore Connect",
+        "Build Web and Publish to Firebase Hosting"
+      ]
+    },
+    "go-measure": {
+      "display_name": "Go Measure",
+      "repository": "MarketplaceSoftware/go_measure",
+      "directory": "go_measure",
+      "runbook": "docs/codemagic-publishing.md",
+      "staging_checks": [
+        "Android internal testing",
+        "iOS external TestFlight",
+        "Firebase staging"
+      ],
+      "codemagic_checks": [
+        "Android production",
+        "iOS App Store",
+        "Firebase production"
+      ]
+    }
   },
   "defaults": {
     "dev_branch": "dev",

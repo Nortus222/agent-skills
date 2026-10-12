@@ -1,3 +1,9 @@
+The responses below record historical tests of the original skill. Current
+selection requires an explicit `--app` for every requested app, including GO
+Measure, and all selected apps use one release workflow. Use the current
+[skill instructions](../skills/deploy-mobile-apps/SKILL.md) for commands and
+approval points.
+
 # No-skill baseline
 
 Prompt:

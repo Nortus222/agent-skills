@@ -78,7 +78,7 @@ class GitAuthTests(unittest.TestCase):
             mobile_release, "build_operator", return_value=self.operator
         ):
             with mock.patch("sys.stdout", stdout):
-                result = mobile_release.main(["preflight", "--json"])
+                result = mobile_release.main(["preflight", "--app", "pocket-manage", "--json"])
         self.assertEqual(result, 1)
         recovery = json.loads(stdout.getvalue())["recovery"]
         self.assertIsNotNone(recovery)
@@ -115,7 +115,9 @@ class GitAuthTests(unittest.TestCase):
         for command in ("preflight", "prepare", "release", "status"):
             with self.subTest(command=command):
                 argv = [command, "--git-auth", "gh"]
-                if command != "preflight":
+                if command == "preflight":
+                    argv.extend(["--app", "pocket-manage"])
+                else:
                     argv.extend(["--batch", "batch-1"])
                 self.assertEqual(
                     mobile_release._parser().parse_args(argv).git_auth, "gh"
