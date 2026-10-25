@@ -95,6 +95,9 @@ class PollPolicy:
     # the full timeout cannot outlast a queue, so observation gets its own budget
     # and `status` is the way to watch from there.
     observation_timeout_seconds: float = 60.0
+    # Preparation checks include the staging builds, which run for tens of
+    # minutes; poll them gently and without a deadline, as `--watch` did.
+    checks_interval_seconds: float = 30.0
 
 
 class SubprocessRunner:
@@ -2039,12 +2042,14 @@ class ReleaseOperator:
             )
         if not isinstance(checks, list):
             raise ReleaseError(f"repository {app.repository}: invalid preparation check response")
-        if checks and all(
+        # `gh pr checks --watch` refuses `--json`, so wait by polling, and stop
+        # as soon as a check fails, as `--fail-fast` would.
+        while checks and all(
             isinstance(check, dict)
             and check.get("bucket") in {"pass", "pending", "skipping"}
             for check in checks
         ) and any(check.get("bucket") == "pending" for check in checks):
-            checks_command.extend(["--watch", "--fail-fast"])
+            self.clock.sleep(self.poll_policy.checks_interval_seconds)
             checks_result = self.runner.run(checks_command, mutates=False)
             checks = self._load_json(
                 checks_result.stdout,
