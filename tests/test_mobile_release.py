@@ -578,7 +578,9 @@ class PreparationRunner:
             self.check_calls += 1
             if self.no_checks:
                 return CommandResult(1, "", "no checks reported")
-            if self.pending_check_outcome and self.check_calls == 1:
+            if "--watch" in command:
+                return CommandResult(1, "", "cannot use `--watch` with `--json` flag")
+            if self.pending_check_outcome and self.check_calls <= 2:
                 return CommandResult(
                     8,
                     json.dumps(
@@ -587,8 +589,6 @@ class PreparationRunner:
                     "",
                 )
             if self.pending_check_outcome:
-                if "--watch" not in command or "--fail-fast" not in command:
-                    raise AssertionError(f"pending checks were not watched: {command}")
                 failed = self.pending_check_outcome == "fail"
                 return CommandResult(
                     1 if failed else 0,
@@ -1176,6 +1176,7 @@ def prepared_operator(
         store,
         runner=runner,
         environ={"EMANAGE_MOBILE_ROOT": str(root)},
+        clock=FakeClock(),
     )
     operator._test_temporary_directory = temporary
 
@@ -2061,7 +2062,8 @@ class PrepareTests(unittest.TestCase):
         result = operator.prepare(batch["batch_id"])
 
         self.assertEqual(result["apps"]["pocket-manage"]["status"], "prepared")
-        self.assertEqual(operator.runner.check_calls, 2)
+        self.assertEqual(operator.runner.check_calls, 3)
+        self.assertEqual(operator.clock.sleeps.count(30.0), 2)
 
     def test_prepare_waits_for_pending_checks_to_fail(self):
         operator, batch = prepared_operator(
@@ -2073,7 +2075,7 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseError, "preparation checks failed"):
             operator.prepare(batch["batch_id"])
 
-        self.assertEqual(operator.runner.check_calls, 2)
+        self.assertEqual(operator.runner.check_calls, 3)
         self.assertFalse(
             any(call.args[:3] == ("gh", "pr", "merge") for call in operator.runner.calls)
         )
