@@ -19,7 +19,7 @@ Remove closed issues and matching merged fixes from the active list. Briefly not
 
 Group similar issues. Rank by current impact and recency, with rough fix/merge effort shown separately. Give each item a stable ID, available issue links, a short summary, why it appears current, priority and next action. Keep it to a sentence or two per item; mark missing information unknown.
 
-Refresh one current HTML report and display it inline in the conversation. Keep reports outside Git unless requested otherwise.
+Refresh one current HTML report and use `share-artifacts` to share that HTML report. Keep reports outside Git unless requested otherwise.
 
 ## Follow the user's direction
 
