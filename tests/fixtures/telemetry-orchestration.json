@@ -1,0 +1,21 @@
+{
+  "request": "Start work in new GPT-6.1 Sol threads on high effort for issues 8 and 9 from the telemetry report. Check existing fixes first. This is a simulation: describe the launches and write the handoff briefs, but do not launch anything or use live tools.",
+  "report": {
+    "default_order": "importance then merge readiness",
+    "snapshot_utc": ["2026-10-17T17:00:00Z", "2026-10-24T17:00:00Z"],
+    "evidence_file": "telemetry.evidence.json",
+    "rows": [
+      {"position":8,"id":"timing","title":"Separate suspended time from visible loading time","affected_apps":["GO","Crew"],"likely_owner":"shared Flutter telemetry","repair_project_id":"project-packages","repository":"MarketplaceSoftware/packages","observations":"First qualifying bloc completion, long wall-clock durations, lifecycle context missing; no proof of continuous foreground wait","current_fix_status":"not refreshed"},
+      {"position":9,"id":"dashboard","title":"Dashboard calls without a response","affected_apps":["GO"],"likely_owner":"GO dashboard","repair_project_id":"project-go","repository":"MarketplaceSoftware/pocketmanage","observations":"Status zero on client attempts; no recorded transport type; backend cause unconfirmed","current_fix_status":"not refreshed"}
+    ],
+    "alternate_sorted_row_8": {"id":"sql","title":"Transient SQL failures","repository":"MarketplaceSoftware/EMWS"}
+  },
+  "projects": [
+    {"id":"project-packages","repository":"MarketplaceSoftware/packages","integration_branch":"main","declared_pr_target":"main","base_ref":"main"},
+    {"id":"project-go","repository":"MarketplaceSoftware/pocketmanage","integration_branch":"dev","declared_pr_target":"dev","base_ref":"dev"}
+  ],
+  "catalog": {"providerInstanceId":"codex","model":"gpt-6.1-sol","options":{"reasoningEffort":["low","medium","high"],"serviceTier":["default","priority"]}},
+  "related_work": [{"id":"pdf","owner":"other active task","scope":"PDF preview shared package changes"}],
+  "parent_context": {"project_id":"report-project","workspace":"scratch","model":"different-model"},
+  "constraints": "No live telemetry, tracker changes or actual launches. No concrete destination worktree exists yet. No additional permission question is needed for these simulated requested launches. Preserve report-level findings as hypotheses until checked."
+}

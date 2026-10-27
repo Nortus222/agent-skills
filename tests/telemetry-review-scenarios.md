@@ -29,6 +29,16 @@ Use [fixtures/telemetry-lifecycle.json](fixtures/telemetry-lifecycle.json) with 
 - Store versions do not replace telemetry-derived fix floors. Missing versions do not justify permanent `wontfix`. Manual job starts can publish issues.
 - The static Phase 2 packet does not authorize live telemetry or destination-code execution.
 
+## User-directed orchestration
+
+Use [fixtures/telemetry-orchestration.json](fixtures/telemetry-orchestration.json) with the skill in a fresh context. Return simulated launch arguments and bounded handoffs only. The simulated request supplies the model catalog and destination projects; no actual launch is permitted.
+
+- Resolve default rows 8 and 9 to stable IDs `timing` and `dashboard`, excluding the alternate-sorted SQL row.
+- Use top-level `t3_thread_launch` for the explicitly requested new conversations, with the packages and GO project IDs rather than the parent scratch project.
+- Bind separate worktrees to verified `main` and `dev` bases. Place provider instance, model and high effort in `modelSelection.instanceId`, `modelSelection.model` and structured `modelSelection.options`.
+- Include evidence bounds and gaps, existing-fix/adoption checks, staging/deployment context, shared-code ownership, authorization limits and appropriate completion criteria in each brief.
+- Retain exact thread IDs, verify the requested setup and track workstream outcomes. An accepted launch does not establish completed repair. Lost launch responses require checking existing threads before retrying.
+
 ## Validation record
 
 Validated on 2026-10-26 with GPT-6.1 Sol through the Codex harness in T3 Code, reasoning effort high.
@@ -40,3 +50,5 @@ Five independent skill-equipped runs kept closed/merged work in delivery follow-
 The first lifecycle run correctly handled coverage, merged-fix eligibility, quiet-period eligibility and static access, but left unversioned request reopening as unresolved. After clarifying that explicit runner rule, a fresh lifecycle run reported the HTTP failure recurrence and reopening behavior correctly. The remaining lifecycle checks passed.
 
 An independent static review found no material findings. Frontmatter validation, local reference resolution, JSON parsing and whitespace checks passed. Azure query flags were checked against installed CLI help. No live query execution, issue publication, release or end-to-end artifact serving was exercised by these tests. This repository has no solution build for skill documentation.
+
+The orchestration follow-up used one current-skill baseline and one fresh forward evaluation. Both selected the intended report rows, repair projects and worktree bases. The baseline placed provider/model/options at the launch root, which does not match `t3_thread_launch`. With the orchestration reference, the forward evaluation used `modelSelection.instanceId`, `.model` and structured `.options`, preserved high effort, and supplied scoped handoffs and explicit missing evidence. The example was checked against live tool metadata and current thread configuration. A focused independent review found no material findings. Actual remediation launches were not performed.

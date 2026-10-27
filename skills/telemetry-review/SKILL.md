@@ -36,4 +36,8 @@ Rank active work by current impact and recent observed changes, with urgent data
 
 On refresh, recheck GitHub state, remove closed incidents and completed merged work from the active list, and update all counts, groups and charts consistently. Retain any independently actionable rollout task in the follow-up section. Keep historical snapshots outside the user-facing current list.
 
-Save reports and diagnostic exports outside Git unless requested otherwise. Use `share-artifacts` for downloadable HTML and verify its final URL. When available, preview and render a concise inline view. For authorized issue work, use `triage` with the linked lifecycle policy and current account-attribution instructions. Use `emws-api` for supported API probes. Launch separate conversations only when explicitly requested, preserving the requested project, model and options.
+Save reports and diagnostic exports outside Git unless requested otherwise. Use `share-artifacts` for downloadable HTML and verify its final URL. When available, preview and render a concise inline view. For authorized issue work, use `triage` with the linked lifecycle policy and current account-attribution instructions. Use `emws-api` for supported API probes.
+
+## Start selected work
+
+When the user directs work into new threads, read [orchestration.md](references/orchestration.md) and launch the selected work with its correct project, workspace, model settings and handoff. Use child tasks for in-session delegation; creating separate conversations requires the user's direction. Keep the report linked to each workstream's actual thread and outcome.
