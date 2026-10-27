@@ -1,4 +1,4 @@
 interface:
   display_name: "Telemetry review"
-  short_description: "Review mobile and service telemetry incidents"
-  default_prompt: "Use $telemetry-review to review recent mobile and service telemetry, reconcile existing fixes, and refresh the prioritized report."
+  short_description: "Check current telemetry issues and rank the work"
+  default_prompt: "Use $telemetry-review to check which telemetry issues are still current and give me a short prioritized list."

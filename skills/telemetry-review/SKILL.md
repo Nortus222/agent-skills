@@ -1,43 +1,28 @@
 ---
 name: telemetry-review
-description: Use when reviewing or ranking mobile-app and web-service telemetry, investigating telemetry incidents, refreshing a telemetry work report, or verifying whether an existing fix addresses observed failures.
+description: Use when checking whether mobile-app or web-service telemetry issues are still current, ranking them, or refreshing a prioritized issue list.
 ---
 
 # Telemetry review
 
-Turn current telemetry and repository evidence into a prioritized work list. Keep issue disposition, fix delivery and runtime verification as separate facts.
+Give the user a current, prioritized list so they can choose what to work on. Gather enough evidence to judge currency and priority. Detailed diagnosis belongs to selected follow-up work.
 
-## Establish scope
+## Check currency
 
-Recover the request and prior decisions before collecting data. Reuse an existing report when refreshing it. For an unspecified window, state a default of the last seven days ending at one fixed UTC cutoff. Preserve requested applications, environments, exclusions and output format.
+Use the requested apps, services and period; default to the past week. Start with current issues, recent sightings and existing fix/PR status. Make a small targeted telemetry check only when needed.
 
-For fleet reviews, discover the current route registry and explicitly requested services. Account for every selected application/environment; distinguish configured routes from the deployed job's coverage. Read [collect-evidence.md](references/collect-evidence.md) before querying or interpreting telemetry. Read [incident-lifecycle.md](references/incident-lifecycle.md) before assessing existing fixes, markers or closure candidates.
+Classify issues as current, already addressed, or uncertain. Comment updates are not new failures, and missing telemetry does not prove recovery. If a quick check cannot settle currency, mark it uncertain and move on. Ranking does not require reproducing every issue or auditing every deployment.
 
-A report request authorizes investigation and reporting. Apply tracker changes or remediate code when requested. Existing authorization persists within its scope; past permission on an unrelated incident adds no authority. Leave extraction, fingerprints, publication and recurrence suppression in the existing telemetry service.
+Remove closed issues and matching merged fixes from the active list. Briefly note actionable rollout work separately.
 
-## Gather and reconcile
+## Rank and report
 
-1. Record source freshness, traffic, platform and build coverage before evaluating failures. Missing or sparse data is a coverage finding. Query failures and partial results are unresolved evidence.
-2. Refresh issues, full comments, linked/open PRs, matching commits, consumer pins and deployed versions. Pin the configured assessment branch's commit; distinguish that repair context from the failing deployment. Search local source with `rg`; old assessments are hypotheses.
-3. Group related symptoms by plausible mechanism and user workflow. Correlate wrappers before counting independent failures. Keep repository-scoped incident identities and environment-specific evidence visible within cross-repository workstreams.
-4. For each finding, separate observation, confirmed mechanism, hypothesis and missing evidence. Name the likely repair owner, including shared packages or infrastructure when appropriate. End with a concrete next action and the evidence needed to verify it.
+Group similar issues. Rank by current impact and recency, with rough fix/merge effort shown separately. Give each item a stable ID, available issue links, a short summary, why it appears current, priority and next action. Keep it to a sentence or two per item; mark missing information unknown.
 
-## Produce the current work list
+Refresh one current list. Use HTML for fleet reports unless another format was requested, and `share-artifacts` for downloadable reports. Keep reports outside Git unless requested otherwise.
 
-Use HTML for a fleet review unless another format was requested. A focused answer can stay in chat. Keep one current prioritized list with stable workstream IDs; display positions may change with sorting. A selected row number resolves against the report's stated default order, never directly to a GitHub issue number.
+## Follow the user's direction
 
-The report contains:
+When asked, start selected items in new threads without asking again. Use the correct repair project and dedicated worktree, preserve the requested model/effort, and pass issue links plus a short assessment and scope. Track thread links and actual outcomes. Keep in-session subagents distinct from new conversations.
 
-- A scope and coverage summary with exact UTC bounds, source freshness and limitations.
-- Active work grouped by similarity. Each item names affected apps/environments, last observed occurrence, current-window counts with units, impact, confidence, linked incidents/fixes, repair owner, merge effort/readiness and next action.
-- A separate delivery/verification follow-up section for closed or merged work whose adoption, release or runtime outcome remains pending.
-
-Rank active work by current impact and recent observed changes, with urgent data-integrity or outage risks first. Show merge ease separately; a green check does not resolve conflicts. Use telemetry occurrence time rather than comment update time. Keep old low-volume incidents in a separate backlog.
-
-On refresh, recheck GitHub state, remove closed incidents and completed merged work from the active list, and update all counts, groups and charts consistently. Retain any independently actionable rollout task in the follow-up section. Keep historical snapshots outside the user-facing current list.
-
-Save reports and diagnostic exports outside Git unless requested otherwise. Use `share-artifacts` for downloadable HTML and verify its final URL. When available, preview and render a concise inline view. For authorized issue work, use `triage` with the linked lifecycle policy and current account-attribution instructions. Use `emws-api` for supported API probes.
-
-## Start selected work
-
-When the user directs work into new threads, read [orchestration.md](references/orchestration.md) and launch the selected work with its correct project, workspace, model settings and handoff. Use child tasks for in-session delegation; creating separate conversations requires the user's direction. Keep the report linked to each workstream's actual thread and outcome.
+A review alone does not authorize fixes, issue changes or new work threads.
