@@ -1,0 +1,4 @@
+interface:
+  display_name: "Telemetry review"
+  short_description: "Check current telemetry issues and rank the work"
+  default_prompt: "Use $telemetry-review to check which telemetry issues are still current and give me a short prioritized list."
