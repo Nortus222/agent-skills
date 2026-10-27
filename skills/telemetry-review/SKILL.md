@@ -1,34 +1,30 @@
 ---
 name: telemetry-review
-description: Use when checking and ranking current mobile-app or web-service telemetry issues, refreshing the issue list, or closing telemetry issues resolved by merged fix PRs.
+description: Use when reviewing mobile-app or web-service telemetry issues, or closing them after fix PRs merge.
 ---
 
 # Telemetry review
 
-Give the user a current, prioritized list so they can choose what to work on. Gather enough evidence to judge currency and priority. Detailed diagnosis belongs to selected follow-up work.
+Produce a current, prioritized HTML report that helps the user choose what to work on.
 
-## Check currency
+## Check current status
 
-Use the requested apps, services and period; default to the past week. Start with current issues, recent sightings and existing fix/PR status. Make a small targeted telemetry check only when needed.
+Use the requested apps, services and period; default to the past week. Check recent sightings and existing fix/PR status. Make a targeted telemetry check where the issue evidence is insufficient.
 
-Classify issues as current, already addressed, or uncertain. Comment updates are not new failures, and missing telemetry does not prove recovery. If a quick check cannot settle currency, mark it uncertain and move on. Ranking does not require reproducing every issue or auditing every deployment.
-
-Remove closed issues and matching merged fixes from the active list. Briefly note actionable rollout work separately.
+Finish this pass when every issue is marked current, already addressed or uncertain, with a short reason. Comment updates are not new failures, and missing telemetry does not prove recovery. If the targeted check leaves the status unclear, mark it uncertain and move on. Detailed diagnosis belongs to selected follow-up work.
 
 ## Close fixed issues
 
-When a matching fix PR has merged, apply `telemetry-fixed` to the telemetry issues it resolves and close them. Confirm the PR addresses each issue; a merged fix is enough, without waiting for release or deployment. An open PR or quiet telemetry alone does not establish a merged fix.
+Confirm that a matching fix PR has merged, then apply `telemetry-fixed` and close the issues it resolves. Release or deployment is not required. An open PR or quiet telemetry alone is insufficient for this closure.
 
-Include this rule in follow-up thread handoffs. Report the closed issue links and matching fix PR, and remove them from the active list. Keep any pending rollout as a brief separate follow-up.
+Report the closed issue links and matching fix PR. Exclude closed issues and merged fixes from active priorities; note actionable rollout work separately. Other issue changes and implementation require the user's direction.
 
-## Rank and report
+## Rank and share
 
-Group similar issues. Rank by current impact and recency, with rough fix/merge effort shown separately. Give each item a stable ID, available issue links, a short summary, why it appears current, priority and next action. Keep it to a sentence or two per item; mark missing information unknown.
+Group similar issues and rank by current impact and recency. Show rough fix/merge effort separately. Give each item a stable ID, available issue links, a short summary, current status, priority and next action. Use a sentence or two per item and mark missing information unknown.
 
-Refresh one current HTML report and use `share-artifacts` to share that HTML report. Keep reports outside Git unless requested otherwise.
+Refresh one current HTML report and share it using `share-artifacts`. Keep reports outside Git unless requested otherwise.
 
-## Follow the user's direction
+## Start selected work
 
-When asked, start selected items in new threads without asking again. Use the correct repair project and dedicated worktree, preserve the requested model/effort, and pass issue links plus a short assessment and scope. Track thread links and actual outcomes. Keep in-session subagents distinct from new conversations.
-
-Closing issues with verified merged fixes is part of this workflow. Other issue changes, implementation and new work threads require the user's direction.
+When the user requests new threads, launch the selected items without asking again. Resolve report selections to stable IDs, use the correct repair project and dedicated worktree, and preserve the requested model/effort. Pass issue links, a short assessment, scope and the merged-fix closure rule. Track thread links and actual outcomes. Keep in-session subagents distinct from requested new conversations.
