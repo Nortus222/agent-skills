@@ -24,6 +24,7 @@ npx skills update
 | [emws-api](skills/emws-api/) | You need to call or verify the e-manage\|ONE API on staging or production with locally configured credentials, structured errors, and a call log. |
 | [explain](skills/explain/) | You want something explained so you genuinely understand it — a file, class, module, subsystem, concept, commit range, branch diff, uncommitted work, or PR. Writes a self-contained HTML document with rendered Mermaid diagrams. |
 | [share-artifacts](skills/share-artifacts/) | An agent produces an HTML report, downloadable file, or local web preview to open on another device. Provides a verified Tailscale link and keeps the server available after handoff. |
+| [telemetry-review](skills/telemetry-review/) | Review mobile and service telemetry, rank current work, reconcile existing fixes, and refresh the report. |
 
 ## How this fits the rest of the setup
 
