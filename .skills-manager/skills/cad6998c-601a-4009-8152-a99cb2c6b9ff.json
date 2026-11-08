@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "cad6998c-601a-4009-8152-a99cb2c6b9ff",
+  "path": "skills/telemetry-review",
+  "path_key": "skills/telemetry-review",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "import",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}

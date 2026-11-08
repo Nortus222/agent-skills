@@ -1,2 +1,7 @@
 .claude/worktrees/
 __pycache__/
+.DS_Store
+Thumbs.db
+*.tmp
+.skills-manager.lock
+*.pyc

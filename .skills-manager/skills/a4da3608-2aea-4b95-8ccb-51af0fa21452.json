@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "a4da3608-2aea-4b95-8ccb-51af0fa21452",
+  "path": "skills/deploy-mobile-apps",
+  "path_key": "skills/deploy-mobile-apps",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "import",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}

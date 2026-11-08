@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "4e766a92-0a1f-42c9-a5ad-17a5e5d12fe6",
+  "path": "skills/emws-api",
+  "path_key": "skills/emws-api",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "import",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}
